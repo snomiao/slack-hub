@@ -650,7 +650,23 @@ export async function reactionAdd(
   name: string,
   cookie?: string,
 ): Promise<void> {
-  await post(token, "reactions.add", { channel, timestamp: ts, name }, cookie);
+  const params = { channel, timestamp: ts, name };
+  try {
+    await post(token, "reactions.add", params, cookie);
+  } catch (e) {
+    // chat:write.public can post without membership, but cannot seed answer
+    // pills there. Only recover a bot's membership error; joining a public
+    // channel needs channels:join and cannot invite a bot to a private one.
+    if (!token.startsWith("xoxb-") || !channel.startsWith("C") ||
+        !(e instanceof Error) || e.message !== "Slack error on reactions.add: not_in_channel") throw e;
+    try {
+      await post(token, "conversations.join", { channel }, cookie);
+    } catch (joinError) {
+      throw new Error(`Could not join channel to add reaction: ${joinError instanceof Error ? joinError.message : String(joinError)}\n  Invite the bot to the channel, or grant channels:join for public channels.`);
+    }
+    // Retry once: a failed join or retry still reaches the caller's warning.
+    await post(token, "reactions.add", params, cookie);
+  }
 }
 
 // Read the reactions currently on a message. Returns one entry per emoji with

@@ -395,6 +395,36 @@ describe("ask/poll --as-bot resolve with the bot token (CLI)", { timeout: 60_000
     SLACK_BOT_TOKEN: "xoxb-test", SLACK_COOKIE: "fake-user-cookie" };
 
   for (const cmd of ["ask", "poll"] as const) {
+    test(`${cmd} --as-bot joins after a membership error and seeds every pill`, async () => {
+      const m = await startMock({ inline: {
+        ...botFixtures(),
+        "reactions.add": { __sequence: [{ ok: false, error: "not_in_channel" }, { ok: true }] },
+        "conversations.join": { ok: true },
+      } });
+      try {
+        const base = [cmd, "#chan", "@bob may I proceed?", "yes", "no", "--as-bot", "--channel-id", CHAN];
+        const preview = await run(base, m.baseUrl, env);
+        expect(m.requests.some((r) => r.method === "conversations.join")).toBe(false);
+        const sent = await run([...base, `--code=${extractCode(preview.stderr)}`], m.baseUrl, env);
+        expect(sent.exitCode, sent.stderr).toBe(0);
+        expect(sent.stderr).not.toContain("could not add");
+        const writes = m.requests.filter((r) => ["chat.postMessage", "reactions.add", "conversations.join"].includes(r.method));
+        expect(writes.map((r) => r.method)).toEqual([
+          "chat.postMessage", "reactions.add", "conversations.join", "reactions.add", "reactions.add", "reactions.add",
+        ]);
+        const seeds = writes.filter((r) => r.method === "reactions.add").map((r) => JSON.parse(r.body).name);
+        expect(seeds).toEqual(cmd === "ask" ? ["one", "one", "two", "heavy_plus_sign"] : ["ballot_box_with_ballot", "ballot_box_with_ballot", "one", "two"]);
+        expect(writes[1]!.body).toBe(writes[3]!.body);
+        expect(JSON.parse(writes[2]!.body)).toEqual({ channel: CHAN });
+        for (const r of writes) {
+          expect(r.headers.authorization).toBe("Bearer xoxb-test");
+          expect(r.headers.cookie).toBeUndefined();
+        }
+      } finally { await m.stop(); }
+    });
+  }
+
+  for (const cmd of ["ask", "poll"] as const) {
     for (const target of ["channel", "dm-id", "dm-name"] as const) {
       test(`${cmd} --as-bot ${target}: dead user token, bot token resolves everything`, async () => {
         const m = await startMock({ inline: botFixtures() });
