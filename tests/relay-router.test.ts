@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as r from "../worker/src/router.ts";
-import { RouterClient, SeenSet, parseHandlers, readToken, routerWsUrl, runHandler } from "../ts/relayRouter.ts";
+import { RouterClient, SeenSet, daemonProtocols, nextBackoff, parseHandlers, readToken, routerWsUrl, runHandler, tokenRejected } from "../ts/relayRouter.ts";
 
 class FakeWire implements r.Wire {
   out: [string, r.Frame][] = [];
@@ -155,6 +155,28 @@ describe("router: delivery and de-dup", () => {
   });
 });
 
+describe("router: daemon handshake auth", () => {
+  const T = "tok-1";
+  test("the daemon's real subprotocol header is accepted on /router/ws", () => {
+    const header = daemonProtocols(T).join(", ");
+    expect(r.routerAuthorized("/router/ws", null, header, T)).toBe(true);
+  });
+  test("refused: wrong token, router protocol elsewhere, relay protocol on /router/ws, no token configured", () => {
+    expect(r.routerAuthorized("/router/ws", null, daemonProtocols("tok-2").join(", "), T)).toBe(false);
+    expect(r.routerAuthorized("/router/owners", null, daemonProtocols(T).join(", "), T)).toBe(false);
+    expect(r.routerAuthorized("/router/ws", null, `slack-hub-relay.v1, ${daemonProtocols(T)[1]}`, T)).toBe(false);
+    expect(r.routerAuthorized("/router/ws", null, daemonProtocols(T).join(", "), undefined)).toBe(false);
+  });
+  test("the relay's /ws auth does not accept the router protocol", async () => {
+    const hub = await import("../worker/src/hub.ts");
+    expect(hub.protocolAuthorized(daemonProtocols(T).join(", "), T)).toBe(false);
+  });
+  test("a Bearer header works on every router endpoint", () => {
+    expect(r.routerAuthorized("/router/owners", `Bearer ${T}`, null, T)).toBe(true);
+    expect(r.routerAuthorized("/router/owners", "Bearer nope", null, T)).toBe(false);
+  });
+});
+
 describe("routedEvent", () => {
   test("keys a message on channel:ts and keeps the event", () => {
     const p = { type: "event_callback", team_id: "T00000001", event_id: "Ev00000001", event: { type: "message", channel: "C00000001", ts: "1700000001.000000", thread_ts: "1700000000.000100" } };
@@ -167,22 +189,105 @@ describe("routedEvent", () => {
 });
 
 describe("relay daemon client", () => {
-  function client(code = 0) {
+  const role = (r: "leader" | "standby", epoch = 1) => JSON.stringify({ type: "role", role: r, leader: "h", epoch, lease_ms: 10_000, heartbeat_ms: 3_000 });
+  function client(code = 0, lead = true) {
     const sent: string[] = [];
     const runs: unknown[] = [];
     const logs: string[] = [];
+    const clock = { t: 0 };
     const c = new RouterClient(new Map([["alpha", "handle-alpha"], ["*", "handle-any"]]), {
       send: (f) => sent.push(f),
       run: async (cmd, p) => { runs.push([cmd, p]); return code; },
       log: (l) => logs.push(l),
+      now: () => clock.t,
     });
-    return { c, sent, runs, logs };
+    if (lead) void c.frame(role("leader"));
+    logs.length = 0;
+    return { c, sent, runs, logs, clock };
   }
-  const deliver = (id: string, owner = "alpha") => JSON.stringify({ type: "deliver", id, owner, payload: { n: id } });
+  const deliver = (id: string, owner = "alpha", epoch = 1) => JSON.stringify({ type: "deliver", id, owner, payload: { n: id }, epoch });
+
+  test("fencing: a delivery after a local lease expiry is refused, not run, not acked", async () => {
+    const { c, sent, runs, logs, clock } = client();
+    clock.t = 6_000;
+    await c.frame(deliver("m1")); // within lease_ms - heartbeat_ms
+    clock.t = 6_500;
+    await c.frame(JSON.stringify({ type: "lease", epoch: 1, lease_ms: 10_000 }));
+    clock.t = 13_000; // 6.5 s since the last confirmation
+    await c.frame(deliver("m2"));
+    clock.t = 14_000; // paused past 7 s: the buffered delivery is fenced
+    await c.frame(deliver("m3"));
+    expect(runs.map((r) => (r as [string, { n: string }])[1].n)).toEqual(["m1", "m2"]);
+    expect(sent.map((s) => JSON.parse(s).id)).toEqual(["m1", "m2"]);
+    expect(logs).toEqual(["m3: refused (lease expired locally)"]);
+  });
+  test("fencing: an older epoch, or a standby, is refused", async () => {
+    const { c, runs, logs } = client();
+    await c.frame(role("leader", 3));
+    await c.frame(deliver("m1", "alpha", 2));
+    await c.frame(JSON.stringify({ type: "lease", epoch: 2, lease_ms: 10_000 })); // stale lease: ignored
+    expect(c.epoch).toBe(3);
+    await c.frame(role("standby", 4));
+    await c.frame(deliver("m2", "alpha", 4));
+    expect(runs).toEqual([]);
+    expect(logs.filter((l) => l.includes("refused"))).toEqual(["m1: refused (stale epoch 2 < 3)", "m2: refused (not the leader)"]);
+  });
+  test("SIGSTOP scenario end to end: old leader wakes to a buffered delivery and does not handle it", async () => {
+    const { core, wire } = setup({ leaseMs: 10_000 });
+    core.connect("a", "host-a", 0);
+    core.connect("b", "host-b", 0);
+    const A = client(0, false);
+    const B = client(0, false);
+    for (const f of wire.to("a")) await A.c.frame(JSON.stringify(f));
+    for (const f of wire.to("b")) await B.c.frame(JSON.stringify(f));
+    wire.clear();
+    // A stops at t=0. A message arrives; its deliver frame sits in A's socket buffer.
+    core.ingest(ev("1700000001.000000", "1700000000.000100"), 1_000);
+    const buffered = wire.to("a").map((f) => JSON.stringify(f));
+    core.message("b", '{"type":"beat"}', 11_000);
+    core.tick(11_000); // lease lapsed: B promoted and handed the message
+    expect(core.leaderId()).toBe("b");
+    B.clock.t = 11_000;
+    for (const f of wire.to("b")) await B.c.frame(JSON.stringify(f));
+    expect(B.runs.length).toBe(1);
+    // A resumes and reads its buffer before the 4011 close.
+    A.clock.t = 12_000;
+    for (const f of buffered) await A.c.frame(f);
+    expect(A.runs).toEqual([]);
+    expect(A.sent).toEqual([]);
+  });
+  test("the hub confirms a leader's heartbeat, not a standby's; epoch bumps on promotion", () => {
+    const { core, wire } = setup();
+    core.connect("a", "host-a", 0);
+    core.connect("b", "host-b", 0);
+    expect(core.leaderEpoch()).toBe(1);
+    wire.clear();
+    core.message("a", '{"type":"beat"}', 1);
+    core.message("b", '{"type":"beat"}', 1);
+    expect(wire.out).toEqual([["a", { type: "lease", epoch: 1, lease_ms: r.LEASE_MS }]]);
+    core.disconnect("a", 2);
+    expect(core.leaderEpoch()).toBe(2);
+    expect(wire.to("b").at(-1)).toMatchObject({ type: "role", role: "leader", epoch: 2 });
+  });
+  test("runHandler hides the token and the token file from the handler", async () => {
+    const env = { ...process.env, SLACK_ROUTER_TOKEN: "t", SLACK_ROUTER_TOKEN_FILE: "/x" };
+    expect(await runHandler('test -z "${SLACK_ROUTER_TOKEN}${SLACK_ROUTER_TOKEN_FILE}"', {}, env)).toBe(0);
+  });
+  test("backoff: 1 s after a session, capped at 5 s if recently connected, 30 s otherwise", () => {
+    expect(nextBackoff(16_000, true, 0)).toBe(1000);
+    expect(nextBackoff(4_000, false, 60_000)).toBe(5_000);
+    expect(nextBackoff(16_000, false, Infinity)).toBe(30_000);
+    expect(nextBackoff(1_000, false, Infinity)).toBe(2_000);
+  });
+  test("tokenRejected: true on 401 only", async () => {
+    const f = (status: number) => (async () => new Response(null, { status })) as unknown as typeof fetch;
+    expect(await tokenRejected("https://hub.example.com", "t", f(401))).toBe(true);
+    expect(await tokenRejected("https://hub.example.com", "t", f(200))).toBe(false);
+    expect(await tokenRejected("https://hub.example.com", "t", (async () => { throw new Error("down"); }) as unknown as typeof fetch)).toBe(false);
+  });
 
   test("runs the handler once and acks; a redelivery is acked without rerunning", async () => {
     const { c, sent, runs } = client();
-    await c.frame(JSON.stringify({ type: "role", role: "leader", leader: "h", lease_ms: 1, heartbeat_ms: 1 }));
     expect(c.role).toBe("leader");
     await c.frame(deliver("m1"));
     await c.frame(deliver("m1"));
@@ -205,7 +310,9 @@ describe("relay daemon client", () => {
   test("no handler for an owner: logged, unacked", async () => {
     const sent: string[] = [];
     const logs: string[] = [];
-    const c = new RouterClient(new Map(), { send: (f) => sent.push(f), run: async () => 0, log: (l) => logs.push(l) });
+    const c = new RouterClient(new Map(), { send: (f) => sent.push(f), run: async () => 0, log: (l) => logs.push(l), now: () => 0 });
+    await c.frame(role("leader"));
+    logs.length = 0;
     await c.frame(deliver("m1"));
     await c.frame("junk");
     await c.frame(JSON.stringify({ type: "role", role: "standby", leader: null }));

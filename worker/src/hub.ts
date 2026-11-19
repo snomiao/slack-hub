@@ -89,14 +89,14 @@ export function base64url(s: string): string {
 
 /** Does a Sec-WebSocket-Protocol header offer our protocol and this token?
  *  Every offered entry is compared, so timing does not reveal which matched. */
-export function protocolAuthorized(header: string | null, token: string): boolean {
+export function protocolAuthorized(header: string | null, token: string, protocols: readonly string[] = PROTOCOLS): boolean {
   if (!header || !token) return false;
   const want = BEARER_PREFIX + base64url(token);
   let ok = false;
   let ours = false;
   for (const p of header.split(",")) {
     const v = p.trim();
-    if (PROTOCOLS.includes(v)) ours = true;
+    if (protocols.includes(v)) ours = true;
     if (safeEqual(v, want)) ok = true;
   }
   return ok && ours;

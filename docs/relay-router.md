@@ -40,9 +40,29 @@ Slack ──POST /slack/events──▶ Worker ──▶ Router (Durable Object,
   `{"type":"ack","id"}` when it exits 0. Unacked messages are redelivered after
   60 s, and all of them go to a newly promoted leader. Each daemon keeps the
   last 2000 handled ids, so a redelivery whose ack was lost is acked again
-  without running the handler twice. A handler can still see a message twice
-  across a failover (the old leader ran it but died before the ack): handlers
-  should be idempotent on `event_id` / `event.ts`.
+  without running the handler twice.
+- **Fencing (lease epoch).** A leader that is *paused* rather than dead — a
+  SIGSTOP, a long GC stall, a CPU-starved or swapping host, a laptop lid — can
+  wake up after the hub has promoted a standby and handed it the same message,
+  and still find the old delivery in its socket buffer, ahead of the 4011
+  close. To stop it handling that message a second time:
+  - the hub counts promotions (`epoch`) and stamps it on every `role`,
+    `deliver` and `lease` frame;
+  - the hub answers each heartbeat from the leader with
+    `{"type":"lease","epoch","lease_ms"}`, so the daemon has its own clock: the
+    local time of the last confirmed renewal;
+  - the daemon refuses a delivery (does not run it, does not ack it) when it is
+    not the leader, when the delivery's epoch is older than the newest it has
+    seen, or when more than `lease_ms − heartbeat_ms` has passed since its last
+    confirmed renewal. That window ends before the hub's lease does (the hub
+    counts from the heartbeat's arrival, the daemon from the later
+    confirmation), so a paused leader stops before its successor starts.
+  The new leader gets every unacked message, so a refused delivery is not lost.
+- **What fencing does not cover.** A leader that crashes, or is paused
+  *while its handler runs*, after the handler acted but before the ack
+  reaches the hub, will see the message redelivered to the next leader.
+  Delivery is at least once: handlers must be idempotent on `event_id` /
+  `event.ts`.
 
 Unlike the doorbell relay (ids and timestamps only), the router stores the
 Slack event of a routed message until it is acked, because the owner may not
@@ -88,8 +108,15 @@ export SLACK_ROUTER_TOKEN_FILE=~/.config/slack-hub/router-token   # chmod 600; a
 slack relay daemon --handler alpha='my-agent --inbox alpha' --handler '*=logger -t router'
 ```
 
-The token is never taken from argv and never printed; it is not passed on to
-handlers. The daemon reconnects with backoff (1 s, doubling to 30 s).
+The token is never taken from argv and never printed; neither it nor
+`SLACK_ROUTER_TOKEN_FILE` is passed on to handlers. The daemon reconnects at
+once-ish (1 s) after a session ends; failed handshakes back off by doubling,
+capped at 5 s if it was connected in the last 5 minutes (a hub restart) and
+30 s otherwise. When a handshake fails it checks the token against
+`/router/status` and logs `token rejected by the hub (401)` if that is the
+cause. The WebSocket offers the subprotocol `slack-hub-router.v1` (the
+doorbell relay's `/ws` and the router's `/router/ws` each accept only their
+own).
 
 ## Not done yet
 

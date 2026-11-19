@@ -65,7 +65,7 @@ export class SeenSet {
 export function runHandler(command: string, payload: unknown, env: NodeJS.ProcessEnv = process.env): Promise<number> {
   return new Promise((resolve) => {
     // The token is not passed on to handlers.
-    const { SLACK_ROUTER_TOKEN: _, ...rest } = env;
+    const { SLACK_ROUTER_TOKEN: _t, SLACK_ROUTER_TOKEN_FILE: _f, ...rest } = env;
     const p = spawn("sh", ["-c", command], { stdio: ["pipe", "inherit", "inherit"], env: rest });
     p.on("error", () => resolve(127));
     p.on("close", (code) => resolve(code ?? 1));
@@ -79,6 +79,12 @@ export class RouterClient {
   role: "leader" | "standby" | "connecting" = "connecting";
   readonly seen: SeenSet;
   private running = new Set<string>();
+  /** Newest leader epoch seen from the hub. */
+  epoch = 0;
+  /** Local time the hub last confirmed our lease (role or lease frame). */
+  private leaseAt = -Infinity;
+  private leaseMs = 10_000;
+  private heartbeatMs = 3_000;
 
   constructor(
     private readonly handlers: Map<string, string>,
@@ -86,6 +92,8 @@ export class RouterClient {
       send(frame: string): void;
       run(command: string, payload: unknown): Promise<number>;
       log(line: string): void;
+      /** Local monotonic-ish clock (ms); injectable for tests. */
+      now?: () => number;
     },
     seenMax = 2000,
   ) {
@@ -94,15 +102,40 @@ export class RouterClient {
 
   /** Handle one hub frame. Resolves when any handler it started has finished. */
   async frame(data: string): Promise<void> {
-    let f: { type?: string; role?: string; leader?: string | null; id?: unknown; owner?: unknown; payload?: unknown };
+    let f: { type?: string; role?: string; leader?: string | null; id?: unknown; owner?: unknown; payload?: unknown;
+      epoch?: unknown; lease_ms?: unknown; heartbeat_ms?: unknown };
     try { f = JSON.parse(data) as typeof f; } catch { return; }
+    const now = (this.io.now ?? Date.now)();
+    const epoch = typeof f.epoch === "number" ? f.epoch : 0;
     if (f.type === "role" && (f.role === "leader" || f.role === "standby")) {
-      if (f.role !== this.role) this.io.log(f.role === "leader" ? "leader: receiving deliveries" : `standby (leader: ${f.leader ?? "none"})`);
+      if (f.role !== this.role) this.io.log(f.role === "leader" ? `leader (epoch ${epoch}): receiving deliveries` : `standby (leader: ${f.leader ?? "none"})`);
       this.role = f.role;
+      this.epoch = Math.max(this.epoch, epoch);
+      if (typeof f.lease_ms === "number") this.leaseMs = f.lease_ms;
+      if (typeof f.heartbeat_ms === "number") this.heartbeatMs = f.heartbeat_ms;
+      this.leaseAt = f.role === "leader" ? now : -Infinity;
+      return;
+    }
+    if (f.type === "lease") {
+      if (this.role === "leader" && epoch >= this.epoch) { this.epoch = epoch; this.leaseAt = now; }
       return;
     }
     if (f.type !== "deliver" || typeof f.id !== "string" || typeof f.owner !== "string") return;
     const id = f.id;
+    // Fencing. A daemon that was paused (SIGSTOP, a GC stall, a starved CPU)
+    // may wake up to deliveries buffered while it still led — after the hub
+    // has already promoted someone else. Refuse them, without running or
+    // acking: the hub has handed them to the new leader. Our lease is counted
+    // from when the hub confirmed it, and expires one heartbeat early, so it
+    // ends here before it ends at the hub.
+    const reason = this.role !== "leader" ? "not the leader"
+      : epoch < this.epoch ? `stale epoch ${epoch} < ${this.epoch}`
+      : now - this.leaseAt > this.leaseMs - this.heartbeatMs ? "lease expired locally"
+      : null;
+    if (reason !== null) {
+      this.io.log(`${id}: refused (${reason})`);
+      return;
+    }
     // Handled already (a redelivery whose ack was lost): ack again, do not rerun.
     if (this.seen.has(id)) return this.ack(id);
     if (this.running.has(id)) return; // still running; its own ack will follow
@@ -128,6 +161,30 @@ export class RouterClient {
   private ack(id: string): void { this.io.send(JSON.stringify({ type: "ack", id })); }
 }
 
+/** The Sec-WebSocket-Protocol values a daemon offers: the router protocol and the bearer. */
+export function daemonProtocols(token: string): string[] {
+  return [PROTOCOL, BEARER_PREFIX + Buffer.from(token).toString("base64url")];
+}
+
+/** Next reconnect delay. A daemon that was connected in the last RECENT_MS is
+ *  most likely seeing a hub restart or standby churn: retry within 5 s. */
+export const RECENT_MS = 300_000;
+export function nextBackoff(prev: number, opened: boolean, sinceConnectedMs: number): number {
+  if (opened) return 1000;
+  return Math.min(prev * 2, sinceConnectedMs <= RECENT_MS ? 5_000 : 30_000);
+}
+
+/** After a failed handshake: was it the token? (WebSocket close events do not
+ *  carry the HTTP status, so ask an endpoint with the same token.) */
+export async function tokenRejected(base: string, token: string, f: typeof fetch = fetch): Promise<boolean> {
+  try {
+    const res = await f(new URL("/router/status", base), { headers: { authorization: `Bearer ${token}` } });
+    return res.status === 401;
+  } catch {
+    return false;
+  }
+}
+
 export function routerWsUrl(base: string, host: string): string {
   const u = new URL("/router/ws", base);
   u.protocol = u.protocol === "http:" ? "ws:" : "wss:";
@@ -142,8 +199,9 @@ export async function runDaemon(opts: {
 }): Promise<void> {
   const log = opts.log ?? ((l: string) => console.error(`slack relay daemon: ${l}`));
   const host = opts.host ?? hostname();
-  const proto = [PROTOCOL, BEARER_PREFIX + Buffer.from(opts.token).toString("base64url")];
+  const proto = daemonProtocols(opts.token);
   let backoff = 1000;
+  let lastConnected = -Infinity;
   // One client across reconnects: the seen set must outlive a socket.
   let ws: WebSocket | null = null;
   const client = new RouterClient(opts.handlers, {
@@ -161,6 +219,7 @@ export async function runDaemon(opts: {
       opts.signal?.addEventListener("abort", stop, { once: true });
       sock.onopen = () => {
         up = true;
+        lastConnected = Date.now();
         log(`connected as ${host}`);
         beat = setInterval(() => { try { sock.send('{"type":"beat"}'); } catch { /* closing */ } }, 3000);
       };
@@ -175,7 +234,8 @@ export async function runDaemon(opts: {
       sock.onerror = () => {};
     });
     if (opts.signal?.aborted) break;
-    backoff = opened ? 1000 : Math.min(backoff * 2, 30_000);
+    if (!opened && await tokenRejected(opts.url, opts.token)) log("token rejected by the hub (401): check SLACK_ROUTER_TOKEN / SLACK_ROUTER_TOKEN_FILE against the hub's ROUTER_TOKEN");
+    backoff = nextBackoff(backoff, opened, Date.now() - lastConnected);
     await new Promise((r) => setTimeout(r, backoff));
   }
 }

@@ -113,8 +113,7 @@ export default {
  *  GET /router/status, GET /router/ws (the relay daemons). */
 async function routerFetch(req: Request, url: URL, env: Env, ns: DurableObjectNamespace<Router>): Promise<Response> {
   const token = env.ROUTER_TOKEN || env.RELAY_TOKEN;
-  const authed = !!token && (safeEqual(req.headers.get("authorization") ?? "", `Bearer ${token}`) ||
-    (url.pathname === "/router/ws" && hub.protocolAuthorized(req.headers.get("sec-websocket-protocol"), token)));
+  const authed = router.routerAuthorized(url.pathname, req.headers.get("authorization"), req.headers.get("sec-websocket-protocol"), token);
   const stub = ns.get(ns.idFromName("router"));
   if (url.pathname === "/routes") {
     if (!authed && env.ROUTES_PUBLIC !== "1") return new Response("unauthorized", { status: 401 });

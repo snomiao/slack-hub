@@ -18,6 +18,9 @@
 //     A message not acked within REDELIVER_MS is sent again; on a leader change
 //     every unacked message goes to the new leader.
 
+import { protocolAuthorized } from "./hub.ts";
+import { safeEqual } from "./slack.ts";
+
 export const PROTOCOL = "slack-hub-router.v1";
 export const LEASE_MS = 10_000;
 export const HEARTBEAT_MS = 3_000;
@@ -56,8 +59,10 @@ export interface RouterStore {
 export type Conn = { id: string; host: string; since: number; lastBeat: number };
 
 export type Frame =
-  | { type: "role"; role: "leader" | "standby"; leader: string | null; lease_ms: number; heartbeat_ms: number }
-  | { type: "deliver"; id: string; owner: string; payload: unknown };
+  | { type: "role"; role: "leader" | "standby"; leader: string | null; epoch: number; lease_ms: number; heartbeat_ms: number }
+  /** The hub's answer to the leader's heartbeat: its lease runs lease_ms from now. */
+  | { type: "lease"; epoch: number; lease_ms: number }
+  | { type: "deliver"; id: string; owner: string; payload: unknown; epoch: number };
 
 export interface Wire {
   send(connId: string, f: Frame): void;
@@ -69,6 +74,9 @@ export type Result<T = undefined> = { ok: true; value?: T } | { ok: false; statu
 export class RouterCore {
   private conns = new Map<string, Conn>();
   private leader: string | null = null;
+  /** Bumped on every promotion; stamped on role, lease and deliver frames, so a
+   *  daemon can tell a delivery meant for a leadership that has since ended. */
+  private epoch = 0;
   /** id -> when it was last sent to the leader. */
   private inflight = new Map<string, number>();
 
@@ -82,6 +90,7 @@ export class RouterCore {
   private get redeliverMs(): number { return this.opts.redeliverMs ?? REDELIVER_MS; }
 
   leaderId(): string | null { return this.leader; }
+  leaderEpoch(): number { return this.epoch; }
   connections(): Conn[] { return [...this.conns.values()].sort((a, b) => a.since - b.since || (a.id < b.id ? -1 : 1)); }
 
   // ---- owners and routes ----
@@ -129,7 +138,10 @@ export class RouterCore {
 
   heartbeat(id: string, now: number): void {
     const c = this.conns.get(id);
-    if (c) c.lastBeat = now;
+    if (!c) return;
+    c.lastBeat = now;
+    // Confirm the renewal: the daemon's clock for "is my lease still valid".
+    if (id === this.leader) this.wire.send(id, { type: "lease", epoch: this.epoch, lease_ms: this.leaseMs });
   }
 
   disconnect(id: string, now: number): void {
@@ -156,6 +168,7 @@ export class RouterCore {
 
   private elect(now: number): void {
     this.leader = this.connections()[0]?.id ?? null;
+    if (this.leader !== null) this.epoch++;
     this.inflight.clear();
     for (const c of this.conns.values()) this.tell(c.id);
     if (this.leader !== null) this.redeliver(now, true);
@@ -163,7 +176,7 @@ export class RouterCore {
 
   private tell(id: string): void {
     const leader = this.leader === null ? null : this.conns.get(this.leader)?.host ?? null;
-    this.wire.send(id, { type: "role", role: id === this.leader ? "leader" : "standby", leader, lease_ms: this.leaseMs, heartbeat_ms: HEARTBEAT_MS });
+    this.wire.send(id, { type: "role", role: id === this.leader ? "leader" : "standby", leader, epoch: this.epoch, lease_ms: this.leaseMs, heartbeat_ms: HEARTBEAT_MS });
   }
 
   // ---- messages ----
@@ -180,7 +193,9 @@ export class RouterCore {
 
   ack(connId: string, id: string, now: number): boolean {
     // Acks from any daemon count: a demoted leader finishing its handler is still a delivery.
-    if (!this.conns.has(connId)) return false;
+    const c = this.conns.get(connId);
+    if (!c) return false;
+    c.lastBeat = now;
     this.inflight.delete(id);
     return this.store.ackMessage(id, now);
   }
@@ -195,7 +210,7 @@ export class RouterCore {
   private push(m: Message, now: number): void {
     if (this.leader === null) return;
     this.inflight.set(m.id, now);
-    this.wire.send(this.leader, { type: "deliver", id: m.id, owner: m.owner, payload: m.payload });
+    this.wire.send(this.leader, { type: "deliver", id: m.id, owner: m.owner, payload: m.payload, epoch: this.epoch });
   }
 
   /** A client frame (JSON text). Unknown frames are ignored. */
@@ -203,7 +218,7 @@ export class RouterCore {
     let f: { type?: unknown; id?: unknown };
     try { f = JSON.parse(data) as typeof f; } catch { return; }
     if (f.type === "beat") this.heartbeat(connId, now);
-    else if (f.type === "ack" && typeof f.id === "string") { this.heartbeat(connId, now); this.ack(connId, f.id, now); }
+    else if (f.type === "ack" && typeof f.id === "string") this.ack(connId, f.id, now);
   }
 
   status(): { leader: string | null; clients: { host: string; role: string; since: number }[]; pending: number } {
@@ -213,6 +228,16 @@ export class RouterCore {
       pending: this.store.pending().length,
     };
   }
+}
+
+/** May this request use the router's token-protected endpoints? An
+ *  `Authorization: Bearer` header anywhere; on /router/ws also the router
+ *  subprotocol plus `bearer.<base64url(token)>` (only the router's protocol:
+ *  the doorbell relay's /ws does not accept it, nor this one theirs). */
+export function routerAuthorized(path: string, authorization: string | null, subprotocols: string | null, token: string | undefined): boolean {
+  if (!token) return false;
+  if (safeEqual(authorization ?? "", `Bearer ${token}`)) return true;
+  return path === "/router/ws" && protocolAuthorized(subprotocols, token, [PROTOCOL]);
 }
 
 /** The message id and route key of a Slack Events API payload, or null if it is
