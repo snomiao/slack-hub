@@ -214,3 +214,9 @@ cd worker
 printf 'SLACK_SIGNING_SECRET=dev\nRELAY_TOKEN=dev\n' > .dev.vars   # git-ignored
 npx --yes wrangler@4.105.0 dev --local
 ```
+
+## Relay router
+
+The same Worker also hosts an optional **relay router**: a routing table from
+threads to owners, an acked message log, and leader election among several
+`slack relay daemon` clients. See [docs/relay-router.md](../docs/relay-router.md).

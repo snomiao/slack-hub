@@ -21,6 +21,10 @@
 import { DurableObject } from "cloudflare:workers";
 import { type Doorbell, doorbellOf, MAX_BODY_BYTES, plausiblySigned, readLimited, safeEqual, verifySlack } from "./slack.ts";
 import * as hub from "./hub.ts";
+import * as router from "./router.ts";
+import type { Router } from "./routerDo.ts";
+
+export { Router } from "./routerDo.ts";
 
 export interface Env {
   RELAY: DurableObjectNamespace<Relay>;
@@ -30,6 +34,12 @@ export interface Env {
   RELAY_TOKEN: string;
   /** Optional: drop events from any other workspace. */
   SLACK_TEAM_ID?: string;
+  /** Optional: the relay router (docs/relay-router.md). Unbound = router off. */
+  ROUTER?: DurableObjectNamespace<Router>;
+  /** Bearer token for the router's endpoints; default RELAY_TOKEN. */
+  ROUTER_TOKEN?: string;
+  /** "1": GET /routes needs no token (it lists topics and permalinks). */
+  ROUTES_PUBLIC?: string;
 }
 
 /** How long a bell is kept for resume. Longer gaps are covered by the client's
@@ -67,6 +77,8 @@ export default {
       // A single SQLite insert: well inside Slack's 3 s ack budget. Retries of
       // the same event (x-slack-retry-num) collapse on (channel, ts).
       if (bell) await relay.ring(bell);
+      const routed = env.ROUTER ? router.routedEvent(payload, env.SLACK_TEAM_ID || undefined) : null;
+      if (routed && env.ROUTER) await env.ROUTER.get(env.ROUTER.idFromName("router")).ingest(routed);
       return new Response(null, { status: 200 });
     }
 
@@ -91,9 +103,42 @@ export default {
       return relay.fetch(req);
     }
 
+    if (env.ROUTER && (url.pathname === "/routes" || url.pathname.startsWith("/router/"))) return routerFetch(req, url, env, env.ROUTER);
+
     return new Response("not found", { status: 404 });
   },
 } satisfies ExportedHandler<Env>;
+
+/** The router's endpoints: GET /routes, POST /router/owners, POST /router/routes,
+ *  GET /router/status, GET /router/ws (the relay daemons). */
+async function routerFetch(req: Request, url: URL, env: Env, ns: DurableObjectNamespace<Router>): Promise<Response> {
+  const token = env.ROUTER_TOKEN || env.RELAY_TOKEN;
+  const authed = !!token && (safeEqual(req.headers.get("authorization") ?? "", `Bearer ${token}`) ||
+    (url.pathname === "/router/ws" && hub.protocolAuthorized(req.headers.get("sec-websocket-protocol"), token)));
+  const stub = ns.get(ns.idFromName("router"));
+  if (url.pathname === "/routes") {
+    if (!authed && env.ROUTES_PUBLIC !== "1") return new Response("unauthorized", { status: 401 });
+    if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
+    const routes = (await stub.routes()).map(({ channel, thread_ts, owner, topic, permalink, updated }) => ({ channel, thread_ts, owner, topic, permalink, updated }));
+    return Response.json({ routes }, { headers: { "cache-control": "no-store", "access-control-allow-origin": "*" } });
+  }
+  if (!authed) return new Response("unauthorized", { status: 401 });
+  if (url.pathname === "/router/ws") {
+    if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
+    if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") return new Response("upgrade required", { status: 426 });
+    return stub.fetch(req);
+  }
+  if (url.pathname === "/router/status" && req.method === "GET") return Response.json(await stub.status());
+  if ((url.pathname === "/router/owners" || url.pathname === "/router/routes") && req.method === "POST") {
+    const body = await readLimited(req.body, 64 * 1024);
+    if (body === null) return new Response("too large", { status: 413 });
+    let json: unknown;
+    try { json = JSON.parse(body); } catch { return new Response("bad json", { status: 400 }); }
+    if (url.pathname === "/router/owners") return stub.owners((json as { owners?: unknown } | null)?.owners);
+    return stub.putRoute(json);
+  }
+  return new Response("not found", { status: 404 });
+}
 
 /** An SSE client (GET /stream, kept for clients from before /ws).
  *  `pending`: writes not yet taken by the consumer. A client that stops

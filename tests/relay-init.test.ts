@@ -56,7 +56,7 @@ describe("scaffold contents", () => {
   });
 
   test("src/index.ts re-exports the handler and the Durable Object class", () => {
-    expect(relayFiles("r")["src/index.ts"]).toContain('export { default, Relay } from "slack-hub/worker";');
+    expect(relayFiles("r")["src/index.ts"]).toContain('export { default, Relay, Router } from "slack-hub/worker";');
   });
 
   test(".gitignore keeps secrets and build output out", () => {

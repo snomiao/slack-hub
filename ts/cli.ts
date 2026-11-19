@@ -17,6 +17,7 @@ import { cmdTail, parseSince as parseDuration } from "./tail.ts";
 import { phiDelay, runStream, webClient, type StreamMatch } from "./stream.ts";
 import { relaySubscriber, relayTransport } from "./relay.ts";
 import { acquirePushLock, askPushMessage, askPushTag, laneAgent, liveAgents, notifyAgent } from "./askPush.ts";
+import { parseHandlers, readToken, runDaemon } from "./relayRouter.ts";
 import { DEFAULT_DIR, initRelay, initReport, relayHealth } from "./relayInit.ts";
 import { agentCommands } from "./agent.ts";
 import { hubEnv, namedDir, renameNotice } from "./brand.ts";
@@ -8690,7 +8691,27 @@ async function main(): Promise<void> {
             process.exit(r.code);
           },
         )
-        .demandCommand(1, "Specify a relay subcommand (init, health)"),
+        .command(
+          "daemon",
+          "Relay router client: hold the hub's lease (or stand by) and run a handler per route owner for each Slack event (docs/relay-router.md)",
+          (y2) => y2
+            .option("url", { type: "string", describe: "Hub URL (default: $SLACK_ROUTER_URL, else $SLACK_RELAY_URL)" })
+            .option("handler", { type: "array", string: true, describe: "owner=command, repeatable; `*=command` for any other owner. stdin = the event as JSON; exit 0 acks it" })
+            .option("host", { type: "string", describe: "Name this daemon reports to the hub (default: the host name)" }),
+          async (argv) => {
+            const url = argv.url ?? process.env.SLACK_ROUTER_URL ?? process.env.SLACK_RELAY_URL;
+            if (!url) { console.error("slack relay daemon: no hub URL (--url or SLACK_ROUTER_URL)"); process.exit(2); }
+            const t = readToken(process.env);
+            if ("error" in t) { console.error(`slack relay daemon: ${t.error}`); process.exit(2); }
+            const h = parseHandlers(argv.handler ?? []);
+            if ("error" in h) { console.error(`slack relay daemon: ${h.error}`); process.exit(2); }
+            if (!h.handlers.size) { console.error("slack relay daemon: give at least one --handler owner=command"); process.exit(2); }
+            const ac = new AbortController();
+            for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => ac.abort());
+            await runDaemon({ url, token: t.token, handlers: h.handlers, signal: ac.signal, ...(argv.host !== undefined ? { host: argv.host } : {}) });
+          },
+        )
+        .demandCommand(1, "Specify a relay subcommand (init, health, daemon)"),
     )
     .command(
       "stream",
