@@ -61,17 +61,17 @@ export function relayFiles(name: string, opts: { slackHub?: string } = {}): Reco
   "main": "src/index.ts",
   "compatibility_date": "${COMPATIBILITY_DATE}",
   "durable_objects": {
-    "bindings": [{ "name": "RELAY", "class_name": "Relay" }]
+    "bindings": [{ "name": "RELAY", "class_name": "Relay" }, { "name": "ROUTER", "class_name": "Router" }]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Relay"] }],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Relay"] }, { "tag": "v2", "new_sqlite_classes": ["Router"] }],
   // Request bodies are message events from possibly customer-facing channels:
   // keep Workers Logs off so nothing about them is persisted by the platform.
   "observability": { "enabled": false }
 }
 `,
-    "src/index.ts": `// The relay lives in the slack-hub package. Relay (the Durable Object class)
-// must be exported from this main module for the RELAY binding to find it.
-export { default, Relay } from "slack-hub/worker";
+    "src/index.ts": `// The relay lives in the slack-hub package. Relay and Router (the Durable Object
+// classes) must be exported from this main module for their bindings to find them.
+export { default, Relay, Router } from "slack-hub/worker";
 `,
     ".gitignore": "node_modules/\n.wrangler/\n.dev.vars*\n.env*\n",
     "README.md": readme(name),
