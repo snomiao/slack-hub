@@ -5938,6 +5938,22 @@ async function main(): Promise<void> {
   const tok = (a: W) => resolveToken(a.workspace);
   const ck = (a: W) => resolveCookie(a.workspace);
 
+  const channelWriteIdentity = async (argv: W & { "as-bot"?: boolean }): Promise<{ token: string; cookie?: string; asBot: boolean }> => {
+    if (argv["as-bot"]) {
+      const token = requireBotToken();
+      if (argv.workspace) {
+        const [selected, bot] = await Promise.all([authScopes(tok(argv), ck(argv)), authScopes(token)]);
+        if (selected.url !== bot.url) {
+          console.error("Error: --as-bot token belongs to a different workspace than -w; select that workspace's bot token.");
+          process.exit(2);
+        }
+      }
+      return { token, asBot: true };
+    }
+    const cookie = ck(argv);
+    return { token: tok(argv), ...(cookie ? { cookie } : {}), asBot: false };
+  };
+
   /** The `send` handler, shared with `reply` (which resolves its own target,
    *  prefix and thread check first). */
   type SendCli = {
@@ -6286,10 +6302,10 @@ async function main(): Promise<void> {
           (yy) => yy
             .positional("channel", { type: "string", demandOption: true, describe: "#name, channel id, or permalink" })
             .positional("users", { type: "string", array: true, demandOption: true, describe: "@handle or U… ids" })
-            .option("code", { type: "string", describe: "Safety hash to confirm" }),
+            .option("code", { type: "string", describe: "Safety hash to confirm" })
+            .option("as-bot", { type: "boolean", default: false, describe: "Invite via the bot token, without a user-session cookie" }),
           async (argv) => {
-            const token = tok(argv as W);
-            const cookie = ck(argv as W);
+            const { token, cookie, asBot } = await channelWriteIdentity(argv as W & { "as-bot"?: boolean });
             let channel: string;
             const ids: string[] = [];
             try {
@@ -6304,7 +6320,7 @@ async function main(): Promise<void> {
             const code = safetyCode("channel-invite", channel, ids.join(","), self?.userId ?? "");
             if (argv.code !== code) requireCode(argv.code, code, [
               `--- Inviting to a channel --------------------`,
-              fromLine(self, { pad: 9 }),
+              fromLine(self, { pad: 9, asBot }),
               `  channel: ${label}`,
               `  users:   ${ids.join(", ")}`,
               `--------------------------------────────────`,
@@ -6329,10 +6345,10 @@ async function main(): Promise<void> {
             .positional("name", { type: "string", demandOption: true, describe: "Channel name (Slack lowercases it; no spaces)" })
             .option("private", { type: "boolean", default: false, describe: "Create a private channel" })
             .option("invite", { type: "string", array: true, default: [], describe: "Users to invite after creating (@handle or Uxxxx, repeatable)" })
-            .option("code", { type: "string", describe: "Safety hash to confirm create" }),
+            .option("code", { type: "string", describe: "Safety hash to confirm create" })
+            .option("as-bot", { type: "boolean", default: false, describe: "Create and invite via the bot token, without a user-session cookie" }),
           async (argv) => {
-            const token = tok(argv as W);
-            const cookie = ck(argv as W);
+            const { token, cookie, asBot } = await channelWriteIdentity(argv as W & { "as-bot"?: boolean });
             // Slack lowercases and strips the leading #; normalize for preview + code.
             const name = argv.name!.replace(/^#/, "").toLowerCase();
             const isPrivate = argv.private === true;
@@ -6343,7 +6359,7 @@ async function main(): Promise<void> {
             const code = safetyCode(name, String(isPrivate), invites.join(","), self?.userId ?? "");
             if (argv.code !== code) requireCode(argv.code, code, [
               `--- Creating channel -------------------------`,
-              fromLine(self, { pad: 9 }),
+              fromLine(self, { pad: 9, asBot }),
               `  name:    ${isPrivate ? "🔒 " : "#"}${name}`,
               `  private: ${isPrivate}`,
               ...(invites.length ? [`  invite:  ${invites.join(", ")}`] : []),

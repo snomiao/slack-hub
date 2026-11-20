@@ -5,7 +5,7 @@
 
 import { describe, test, expect, beforeAll, afterAll } from "./harness.ts";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -285,5 +285,81 @@ describe("channel rename (CLI)", { timeout: 60_000 }, () => {
     } finally {
       await m.stop();
     }
+  });
+});
+
+
+describe("explicit bot identity for channel writes", { timeout: 60_000 }, () => {
+  beforeAll(() => {
+    mkdirSync(join(tmpHome, ".config", "slack-cli"), { recursive: true });
+    writeFileSync(join(tmpHome, ".config", "slack-cli", "profiles.json"), JSON.stringify({ profiles: { acme: { token: "xoxp-fake", team: "Acme", user: "alice" } } }));
+  });
+  const botAuth = { ok: true, user_id: "U00000002", user: "helperbot", team: "Acme", team_id: "T00000001", url: "https://acme.slack.com/" };
+  const userAuth = { ok: true, user_id: "U00000001", user: "alice", team: "Acme", team_id: "T00000001", url: "https://acme.slack.com/" };
+  const inline = {
+    "auth.test": { __byAuth: { "Bearer xoxb-fake": botAuth, "*": userAuth } },
+    "conversations.create": { ok: true, channel: { id: "C00000042", name: "bot-channel" } },
+    "conversations.info": { ok: true, channel: { id: "C00000042", name: "bot-channel" } },
+    "conversations.invite": { ok: true },
+    "users.info": { ok: true, user: { id: "U00000003", name: "bob" } },
+  };
+  const botEnv = { SLACK_BOT_TOKEN: "xoxb-fake", SLACK_MCP_XOXP_TOKEN: "xoxc-fake", SLACK_COOKIE: "xoxd-fake", SLACK_WORKSPACE: "acme" };
+
+  test("create and post-create invite write only as bot with no session cookie", async () => {
+    const m = await startMock({ inline });
+    try {
+      const args = ["channel", "create", "bot-channel", "--invite", "U00000003", "--as-bot"];
+      const preview = await run(args, { baseUrl: m.baseUrl, env: botEnv });
+      expect(preview.exitCode).toBe(1);
+      expect(preview.stdout).toContain("@helperbot");
+      expect(preview.stdout).toContain("[as bot]");
+      expect(m.requests.some(r => r.method === "conversations.create")).toBe(false);
+      const confirmed = await run([...args, `--code=${extractCode(preview.stderr)}`], { baseUrl: m.baseUrl, env: botEnv });
+      expect(confirmed.exitCode).toBe(0);
+      const writes = m.requests.filter(r => ["conversations.create", "conversations.invite"].includes(r.method));
+      expect(writes).toHaveLength(2);
+      for (const write of writes) {
+        expect(write.headers.authorization).toBe("Bearer xoxb-fake");
+        expect(write.headers.cookie).toBeUndefined();
+      }
+    } finally { await m.stop(); }
+  });
+  test("standalone invite uses bot identity and confirmation gate", async () => {
+    const m = await startMock({ inline });
+    try {
+      const args = ["channel", "invite", "C00000042", "U00000003", "--as-bot"];
+      const preview = await run(args, { baseUrl: m.baseUrl, env: botEnv });
+      expect(preview.exitCode).toBe(1);
+      expect(preview.stdout).toContain("[as bot]");
+      const confirmed = await run([...args, `--code=${extractCode(preview.stderr)}`], { baseUrl: m.baseUrl, env: botEnv });
+      expect(confirmed.exitCode).toBe(0);
+      const invite = m.requests.find(r => r.method === "conversations.invite");
+      expect(invite?.headers.authorization).toBe("Bearer xoxb-fake");
+      expect(invite?.headers.cookie).toBeUndefined();
+    } finally { await m.stop(); }
+  });
+  test("missing bot token never falls back to the available user session", async () => {
+    const m = await startMock({ inline });
+    try {
+      const r = await run(["channel", "create", "bot-channel", "--as-bot"], { baseUrl: m.baseUrl, env: { ...botEnv, SLACK_BOT_TOKEN: "" } });
+      expect(r.exitCode).toBe(1); expect(r.stderr).toContain("no xoxb- token"); expect(m.requests).toHaveLength(0);
+    } finally { await m.stop(); }
+  });
+  test("omitting --as-bot still refuses an unintended user write", async () => {
+    const m = await startMock({ inline });
+    try {
+      const r = await run(["channel", "create", "bot-channel"], { baseUrl: m.baseUrl, env: { SLACK_BOT_TOKEN: "xoxb-fake", SLACK_WORKSPACE: "acme" } });
+      expect(r.exitCode).toBe(2); expect(r.stderr).toContain("refusing to act as YOU"); expect(m.requests).toHaveLength(0);
+    } finally { await m.stop(); }
+  });
+  test("explicit workspace must match the bot workspace", async () => {
+    mkdirSync(join(tmpHome, ".config", "slack-cli"), { recursive: true });
+    writeFileSync(join(tmpHome, ".config", "slack-cli", "profiles.json"), JSON.stringify({ profiles: { acme: { token: "xoxp-fake", team: "Acme", user: "alice" } } }));
+    const m = await startMock({ inline: { ...inline, "auth.test": { __byAuth: { "Bearer xoxb-fake": { ...botAuth, url: "https://other.slack.com/" }, "*": userAuth } } } });
+    try {
+      const r = await run(["channel", "create", "bot-channel", "--as-bot", "-w", "acme"], { baseUrl: m.baseUrl, env: botEnv });
+      expect(r.exitCode).toBe(2); expect(r.stderr).toContain("different workspace");
+      expect(m.requests.some(r => r.method === "conversations.create")).toBe(false);
+    } finally { await m.stop(); }
   });
 });
