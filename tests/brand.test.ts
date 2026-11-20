@@ -1,5 +1,5 @@
 // slack-term → slack-hub rename: new names win, old ones still read.
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "./harness.ts";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
