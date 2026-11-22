@@ -6134,6 +6134,9 @@ async function main(): Promise<void> {
 
   await yargs(cliArgs)
     .scriptName("slack")
+    // yargs' own lookup finds no package.json next to the bundled dist/cli.js
+    // and prints "unknown"; the imported one is bundled in.
+    .version(pkgJson.version)
     // A thrown handler error (e.g. a Slack API failure) is a runtime error, not a usage
     // mistake — print just the clean one-line message, never the command's --help block or a
     // minified source stack. Reserve the usage/help output for actual argument-parse errors
