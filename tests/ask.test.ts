@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startMock, type InlineFixtures } from "./mock.ts";
-import { askBuildText, askBuildResolvedText, askBuildVoidText, askParseMessage } from "../ts/ask.ts";
+import { askBuildText, askBuildResolvedText, askBuildVoidText, askFormatTimeout, askParseMessage, askPositionalFlags, parseAskTimeout } from "../ts/ask.ts";
 import { pollBuildText } from "../ts/poll.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -1978,6 +1978,52 @@ describe("unreadable asks, plain edits, and who the multi-select notice names (C
       } finally {
         await m.stop();
       }
+    }
+  });
+});
+
+describe("ask flag hygiene", () => {
+  test("--choices is an alias for the positional choices, split on |", () => {
+    expect(askPositionalFlags(["#c", "q?", "--choices=A|B | C"])).toEqual({ choices: ["A", "B", "C"], rest: ["#c", "q?"] });
+    expect(askPositionalFlags(["--choices", "X|Y", "#c", "q?", "Z"])).toEqual({ choices: ["X", "Y"], rest: ["#c", "q?", "Z"] });
+    expect(askPositionalFlags(["#c", "q?", "A|B"])).toEqual({ choices: [], rest: ["#c", "q?", "A|B"] });
+    expect(askPositionalFlags(["#c", "--", "--choices=A"])).toEqual({ choices: [], rest: ["#c", "--", "--choices=A"] });
+  });
+
+  test("--question / --target / a valueless --choices are refused", () => {
+    expect(askPositionalFlags(["#c", "--question=hi"])).toHaveProperty("error");
+    expect(askPositionalFlags(["--target", "#c"])).toHaveProperty("error");
+    expect(askPositionalFlags(["#c", "q?", "--choices"])).toHaveProperty("error");
+  });
+
+  test("--timeout takes seconds, durations and forever", () => {
+    expect(parseAskTimeout("3600")).toBe(3600);
+    expect(parseAskTimeout(0)).toBe(0);
+    expect(parseAskTimeout("90s")).toBe(90);
+    expect(parseAskTimeout("30m")).toBe(1800);
+    expect(parseAskTimeout("2h")).toBe(7200);
+    expect(parseAskTimeout("forever")).toBe(Infinity);
+    expect(parseAskTimeout("soon")).toBeUndefined();
+    expect(parseAskTimeout("-5")).toBeUndefined();
+    expect(askFormatTimeout(7200)).toBe("2h");
+    expect(askFormatTimeout(90)).toBe("90s");
+    expect(askFormatTimeout(Infinity)).toBe("forever");
+  });
+});
+
+describe("ask --choices on the CLI", { timeout: 90_000 }, () => {
+  test("--choices=\"A|B\" seeds the buttons instead of being dropped", async () => {
+    const m = await startMock({ inline: { ...AUTH } });
+    try {
+      const r = await run(["ask", "#chan", "@here which?", "--channel-id", CHAN, "--choices=Yes|No"], m.baseUrl);
+      const preview = r.stdout + r.stderr;
+      expect(preview).toContain("1️⃣ Yes");
+      expect(preview).toContain("2️⃣ No");
+      const bad = await run(["ask", "#chan", "--question=hi", "--channel-id", CHAN], m.baseUrl);
+      expect(bad.exitCode).toBe(3);
+      expect(bad.stderr).toContain("--question is not a flag");
+    } finally {
+      await m.stop();
     }
   });
 });

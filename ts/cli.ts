@@ -10,7 +10,7 @@ import { dirname, join, resolve } from "node:path";
 import yargs, { type Options } from "yargs";
 import { hideBin } from "yargs/helpers";
 import { fixUrlBoundaries, guardUrlBoundaries } from "./urlGuard.ts";
-import { listProfiles, removeProfile, resolveBotToken, resolveCookie, resolveToken, useProfile, type Profile } from "./profiles.ts";
+import { listProfiles, removeProfile, resolveBotToken, resolveCookie, resolveToken, tokenSource, useProfile, type Profile } from "./profiles.ts";
 import { diagnoseBotMessaging, formatDiagnosis } from "./botdoctor.ts";
 import { cmdAuthLogin, cmdAuthLoginChrome, cmdAuthChrome, cmdAuthFirefox, cmdAuthToken, cmdAuthApp, cmdAuthSave, cmdAuthTokens } from "./auth.ts";
 import { cmdTail, parseSince as parseDuration } from "./tail.ts";
@@ -54,6 +54,9 @@ import {
   type AskLang,
   ASK_POLL,
   askNextPollDelay,
+  askFormatTimeout,
+  askPositionalFlags,
+  parseAskTimeout,
 } from "./ask.ts";
 import { applyPrefix, findScope, initScope, isRestricted, listAliases, lookupAlias, readSettings, RestrictedError, setAlias, threadMismatch, unsetAlias, whoSubscribes, type MessagePlace, type Scope } from "./scope.ts";
 import { keepLanePrefix, tickText } from "./tick.ts";
@@ -135,6 +138,7 @@ import {
   savedDelete,
   savedList,
   savedUpdate,
+  setAuthSourceLabel,
 } from "./slack.ts";
 import { isDone, messagePermalink, parseSavedItems, sortTodos, TODO_FILTERS, todoStatus, type TodoFilter, type TodoItem } from "./slackTodos.ts";
 import {
@@ -3662,7 +3666,7 @@ async function askWaitForAnswer(token: string, ctx: AskWaitCtx): Promise<never> 
   if (timeout === 0) {
     console.error(`No answer yet: ${shown}`);
   } else {
-    console.error(`Error: no answer within ${timeout}s (the message is left in place)`);
+    console.error(`Error: no answer within ${askFormatTimeout(timeout)} (the message is left in place)`);
     console.error(`  ${shown}`);
     console.error(`  To collect later:  ${askResumeCommand(shown, ctx.asBot, ctx.after)}`);
   }
@@ -3933,7 +3937,7 @@ async function cmdAsk(token: string, args: AskArgs): Promise<void> {
   }
 
   const timeout = args.timeout ?? 3600;
-  console.error(`  Waiting for an answer (up to ${timeout}s)… Ctrl-C to stop`);
+  console.error(`  Waiting for an answer (up to ${askFormatTimeout(timeout)})… Ctrl-C to stop`);
 
   const ctx: AskWaitCtx = {
     channelId,
@@ -5935,7 +5939,25 @@ async function main(): Promise<void> {
   if (notice) console.error(notice);
 
   type W = { workspace?: string };
-  const tok = (a: W) => resolveToken(a.workspace);
+  let tokenNoteShown = false;
+  const tok = (a: W) => {
+    const t = resolveToken(a.workspace);
+    const src = tokenSource();
+    if (src) {
+      // Name the source, never the value. An identity (`slack @who …`) put the
+      // token in the env on purpose, so that is labelled as the identity.
+      const id = process.env.SLACK_HUB_IDENTITY;
+      const file = src.kind === "env" ? dotenvSource.get("SLACK_TOKEN") : undefined;
+      const label = id && src.kind === "env" ? `identity @${id}` : file ? `${src.name} in ${file}` : src.name;
+      setAuthSourceLabel(label);
+      if (!id && src.kind === "env" && src.shadowed.length > 0 && !tokenNoteShown) {
+        tokenNoteShown = true;
+        const cookieNote = process.env.SLACK_COOKIE ? " (and SLACK_COOKIE)" : "";
+        console.error(`note: using ${label}${cookieNote}, which overrides profiles.json (${src.shadowed.join(", ")}); unset it or pass --workspace <name> to use a profile`);
+      }
+    }
+    return t;
+  };
   const ck = (a: W) => resolveCookie(a.workspace);
 
   /** The `send` handler, shared with `reply` (which resolves its own target,
@@ -6121,7 +6143,21 @@ async function main(): Promise<void> {
   };
 
   // `slack @<who> <command> …`: act as a named identity (ts/identity.ts).
-  const { who, rest: cliArgs } = splitWho(hideBin(process.argv));
+  const { who, rest: whoRest } = splitWho(hideBin(process.argv));
+  // `ask --choices "A|B"`: an alias for the positional choices, taken out
+  // before yargs (see askPositionalFlags for why yargs cannot be left to it).
+  let cliArgs = whoRest;
+  let askChoicesFlag: string[] = [];
+  const askAt = whoRest.findIndex((a) => !a.startsWith("-"));
+  if (askAt >= 0 && whoRest[askAt] === "ask") {
+    const f = askPositionalFlags(whoRest.slice(askAt + 1));
+    if ("error" in f) {
+      console.error(`Error: ${f.error}`);
+      process.exit(ASK_EXIT_ERROR);
+    }
+    cliArgs = [...whoRest.slice(0, askAt + 1), ...f.rest];
+    askChoicesFlag = f.choices;
+  }
   let whoKind: "bot" | "user" | undefined;
   if (who) {
     const r = applyIdentity(who);
@@ -7083,7 +7119,7 @@ async function main(): Promise<void> {
       (y) => y
         .positional("target", { type: "string", describe: "#chan, @user, #chan:thread_ts, or permalink (omit with --waitFor)" })
         .positional("question", { type: "string", describe: "The question. Must @tag whoever may answer (@alice), or the whole channel (@here / @channel / @everyone) — only their answer counts. In a 1:1 DM the other party counts automatically." })
-        .positional("choices", { type: "string", array: true, describe: "Up to 10 choices, seeded as 1️⃣..🔟 reactions. Beyond 10 they are listed but answerable only by text. With none, the question asks for a free-text reply." })
+        .positional("choices", { type: "string", array: true, describe: "Up to 10 choices, seeded as 1️⃣..🔟 reactions. Beyond 10 they are listed but answerable only by text. With none, the question asks for a free-text reply. Also accepted as --choices \"A|B|C\" (split on |)." })
         .option("code", { type: "string", describe: "Safety hash to confirm the ask" })
         .option("allow-url-adjacent", { type: "boolean", default: false, describe: "Warn instead of refusing ambiguous bare URL boundaries" })
         .option("body", { type: "string", describe: "Extra context shown under the question" })
@@ -7110,11 +7146,12 @@ async function main(): Promise<void> {
         .option("explain", { type: "boolean", describe: "Also offer an ℹ️ 'explain' pill (seeded after ➕): pressing it asks YOU to explain the question in its thread and is never an answer — the question stays open. --wait/--waitFor report it on stderr (and as `explain` in --json), and post one thread note per question. Default: $SLACK_HUB_ASK_EXPLAIN=1 turns it on; --no-explain turns it off." })
         .option("explain-exit", { type: "boolean", default: false, describe: "With --wait / --waitFor: exit 7 (stdout empty; --json status \"explain\") when someone presses ℹ️ — once per question, on the run that posts the thread note. The question stays open: explain, then collect again." })
         .option("json", { type: "boolean", default: false, describe: "With --pending: one JSON object per answered question (sender, answer, collect command). With --wait / --waitFor: print ONE JSON object on stdout — {status, answer, how, who, notes:[{ts,user,text,permalink}], cursor, permalink} — instead of the bare answer. `notes` are the audience's replies that are not the answer (thread replies; plain replies too in a 1:1 DM). Exit codes unchanged." })
-        .option("timeout", { type: "number", default: 3600, describe: "Overall limit for --wait / --waitFor, in seconds (0 with --waitFor = check once)" })
+        .option("timeout", { type: "string", default: "3600", describe: "Overall limit for --wait / --waitFor: seconds or a duration (90s, 30m, 2h, 1d), or `forever`. 0 with --waitFor = check once. Running out exits 2 (stdout empty) — never mistaken for an answer" })
         .option("channel-id", { type: "string", describe: "Raw channel ID" })
         .option("user-id", { type: "string", describe: "Raw user ID (opens DM)" })
         .option("as-bot", { type: "boolean", default: false, describe: "Ask via the bot token (xoxb / SLACK_BOT_TOKEN) so a DM notifies the recipient. @tags and an @user target then resolve with the bot token too (needs users:read)." }),
       async (argv) => {
+        if (askChoicesFlag.length) argv.choices = [...((argv.choices as string[] | undefined) ?? []), ...askChoicesFlag];
         // Verbs. A target is always #chan / @user / a permalink / a raw ID, so a
         // bare word here cannot be one — `slack ask void …` is unambiguous.
         //   slack ask void <link…> [--reason …] [--superseded-by <link>]   無効化
@@ -7322,11 +7359,11 @@ async function main(): Promise<void> {
           argv.question = undefined;
         }
         const waitFor = argv.waitFor ? String(argv.waitFor) : "";
-        const timeout = Number(argv.timeout);
+        const timeout = parseAskTimeout(argv.timeout);
         // 0 is a real value only for --waitFor ("look once"). For --wait it would
         // mean "give up before asking", which is never what anyone meant.
-        if (!Number.isFinite(timeout) || timeout < 0 || (timeout === 0 && !waitFor)) {
-          console.error("Error: --timeout must be a positive number of seconds");
+        if (timeout === undefined || (timeout === 0 && !waitFor)) {
+          console.error(`Error: --timeout must be a positive number of seconds, a duration (90s, 30m, 2h, 1d) or \`forever\` (got ${stripTerminalControls(String(argv.timeout))})`);
           process.exit(ASK_EXIT_ERROR);
         }
         if (waitFor) {

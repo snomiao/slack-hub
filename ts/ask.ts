@@ -868,3 +868,44 @@ export function askNextPollDelay(prevMs: number, elapsedMs: number): number {
   const cap = elapsedMs < ASK_POLL.fastWindowMs ? ASK_POLL.fastMaxMs : ASK_POLL.slowMaxMs;
   return Math.min(Math.max(prevMs, ASK_POLL.minMs) * ASK_POLL.phi, cap);
 }
+
+
+/** `--timeout` for ask: plain seconds, a duration (90s / 30m / 2h / 1d), or
+ *  forever|never|inf (= Infinity). undefined when it is none of those. */
+export function parseAskTimeout(v: unknown): number | undefined {
+  const t = String(v ?? "").trim().toLowerCase();
+  if (["forever", "never", "inf", "infinity"].includes(t)) return Infinity;
+  if (/^\d+(\.\d+)?$/.test(t)) return Number(t);
+  const m = t.match(/^(\d+(?:\.\d+)?)(s|m|h|d)$/);
+  return m ? Number(m[1]) * { s: 1, m: 60, h: 3600, d: 86400 }[m[2] as "s" | "m" | "h" | "d"] : undefined;
+}
+
+/** Pull `--choices` out of the raw args after `ask` (`--choices=A|B`,
+ *  `--choices A|B`, repeatable; split on |), and refuse `--question` /
+ *  `--target`. All three name POSITIONALS, so yargs' .strict() takes them as
+ *  known flags and lets the positional silently win — a question asked with
+ *  --choices="A|B" went out with no buttons. Done before yargs sees the args:
+ *  `rest` is the args with the --choices flags removed. */
+export function askPositionalFlags(args: string[]): { choices: string[]; rest: string[] } | { error: string } {
+  const raw: string[] = [];
+  const rest: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--") { rest.push(...args.slice(i)); break; }
+    const m = a.match(/^--(choices|question|target)(?:=(.*))?$/s);
+    if (!m) { rest.push(a); continue; }
+    if (m[1] !== "choices") return { error: `--${m[1]} is not a flag: the ${m[1]} is positional — slack ask <target> "<question>" [choice…]` };
+    const val = m[2] ?? args[++i];
+    if (val === undefined || (m[2] === undefined && val.startsWith("--"))) return { error: "--choices needs a value, e.g. --choices \"Yes|No\" (or pass the choices as arguments after the question)" };
+    raw.push(val);
+  }
+  return { choices: raw.flatMap((v) => v.split("|")).map((c) => c.trim()).filter(Boolean), rest };
+}
+
+/** "3600s" reads badly for the long waits --timeout now allows. */
+export function askFormatTimeout(sec: number): string {
+  if (!Number.isFinite(sec)) return "forever";
+  if (sec >= 3600 && sec % 3600 === 0) return `${sec / 3600}h`;
+  if (sec >= 60 && sec % 60 === 0) return `${sec / 60}m`;
+  return `${sec}s`;
+}

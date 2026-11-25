@@ -14,7 +14,9 @@ import {
   setCookie,
   setUserCookie,
   resolveCookie,
+  tokenSource,
 } from "../ts/profiles.ts";
+import { authSourceHint, setAuthSourceLabel } from "../ts/slack.ts";
 
 // Redirect profile storage AND lockfile paths to temp dirs.
 // profiles.ts uses process.env.HOME (via home() helper), so setting HOME here is sufficient.
@@ -461,5 +463,36 @@ describe("profiles: identity-grouped shared cookie", () => {
       url: "https://solo.slack.com/", user: "bob", cookie: "xoxd-own",
     });
     expect(resolveCookie("solo")).toBe("xoxd-own");
+  });
+});
+
+describe("token source (names only, never values)", () => {
+  test("an exported SLACK_TOKEN is reported as env, naming the profiles it shadows", () => {
+    addProfile("acme", fakeProfile);
+    useProfile("acme", true);
+    process.env.SLACK_TOKEN = "xoxp-env-secret";
+    expect(resolveToken()).toBe("xoxp-env-secret");
+    const src = tokenSource()!;
+    expect(src).toEqual({ kind: "env", name: "SLACK_TOKEN", shadowed: ["acme"] });
+    expect(JSON.stringify(src)).not.toContain("secret");
+  });
+
+  test("a selected profile is reported by name", () => {
+    addProfile("acme", fakeProfile);
+    useProfile("acme", true);
+    resolveToken();
+    expect(tokenSource()).toEqual({ kind: "profile", name: 'profile "acme" (~/.slack-cli/workspace)', shadowed: [] });
+    resolveToken("acme");
+    expect(tokenSource()!.name).toBe('profile "acme" (--workspace)');
+  });
+
+  test("auth errors name the failing source; other errors do not", () => {
+    setAuthSourceLabel("SLACK_TOKEN");
+    expect(authSourceHint("token_revoked", "xoxp-x")).toBe(" (token from SLACK_TOKEN)");
+    expect(authSourceHint("invalid_auth", "xoxp-x")).toBe(" (token from SLACK_TOKEN)");
+    expect(authSourceHint("channel_not_found", "xoxp-x")).toBe("");
+    expect(authSourceHint("token_revoked", "xoxb-x")).toBe(" (bot token from SLACK_BOT_TOKEN)");
+    setAuthSourceLabel(undefined);
+    expect(authSourceHint("token_revoked", "xoxp-x")).toBe("");
   });
 });
