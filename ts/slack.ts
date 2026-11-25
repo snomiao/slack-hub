@@ -121,9 +121,22 @@ async function callOnce(token: string, method: string, init: RequestInit, cookie
         `  Or import your Slack desktop session:  slack auth login`,
       );
     }
-    throw new Error(`Slack error on ${method}: ${err}`);
+    throw new Error(`Slack error on ${method}: ${err}${authSourceHint(err, token)}`);
   }
   return body as Json;
+}
+
+// Which credential the CLI is using, by NAME only ("SLACK_TOKEN", `profile "acme"`).
+// Set by cli.ts once the token is resolved, so an auth failure can say which
+// source failed — a revoked exported SLACK_TOKEN otherwise looks like a broken profile.
+let authSourceLabel: string | undefined;
+export function setAuthSourceLabel(label: string | undefined): void { authSourceLabel = label; }
+const AUTH_ERRORS = new Set(["invalid_auth", "not_authed", "token_revoked", "token_expired", "account_inactive"]);
+export function authSourceHint(err: string, token = ""): string {
+  if (!AUTH_ERRORS.has(err)) return "";
+  // Bot tokens only ever come from SLACK_BOT_TOKEN (or an identity's env).
+  if (token.startsWith("xoxb-")) return ` (bot token from ${process.env.SLACK_HUB_IDENTITY ? `identity @${process.env.SLACK_HUB_IDENTITY}` : "SLACK_BOT_TOKEN"})`;
+  return authSourceLabel ? ` (token from ${authSourceLabel})` : "";
 }
 
 // Internal Slack API caller — does NOT reject xoxc tokens.
@@ -164,7 +177,7 @@ async function callSessionOnce(token: string, method: string, init: RequestInit,
         `Attach it with:  slack auth firefox   (Linux/macOS/Windows)   or   slack auth chrome   (macOS/Linux)`,
       );
     }
-    throw new Error(`Slack error on ${method}: ${err}`);
+    throw new Error(`Slack error on ${method}: ${err}${authSourceHint(err, token)}`);
   }
   return body as Json;
 }

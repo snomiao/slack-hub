@@ -248,6 +248,18 @@ export function useProfile(name: string, global = false): void {
   }
 }
 
+/** Where the last resolveToken() answer came from — a NAME (env var or
+ *  profile), never the value. `shadowed` lists the profiles an env token won
+ *  over, which is the case worth telling the user about: a stale exported
+ *  SLACK_TOKEN otherwise reads as a broken profile. */
+export type TokenSource = { kind: "env" | "profile"; name: string; shadowed: string[] };
+let lastTokenSource: TokenSource | undefined;
+export function tokenSource(): TokenSource | undefined { return lastTokenSource; }
+function srcd(token: string, name: string, kind: TokenSource["kind"], shadowed: string[] = []): string {
+  lastTokenSource = { kind, name, shadowed };
+  return token;
+}
+
 export function resolveToken(workspaceFlag?: string): string {
   const store = load();
   const profiles = store.profiles;
@@ -259,16 +271,16 @@ export function resolveToken(workspaceFlag?: string): string {
     if (!profile) {
       throw new Error(`Workspace "${workspaceFlag}" not found. Available: ${names.join(", ") || "(none)"}`);
     }
-    return profile.token;
+    return srcd(profile.token, `profile "${workspaceFlag}" (--workspace)`, "profile");
   }
 
   // SLACK_TOKEN always wins — intended as an explicit per-project override.
-  if (process.env.SLACK_TOKEN) return process.env.SLACK_TOKEN;
+  if (process.env.SLACK_TOKEN) return srcd(process.env.SLACK_TOKEN, "SLACK_TOKEN", "env", names);
 
   // SLACK_BOT_TOKEN and SLACK_MCP_XOXP_TOKEN: only used when no profiles exist.
   // Bot tokens in shell env or .env files must not shadow workspace profiles.
   const legacyEnvToken = process.env.SLACK_BOT_TOKEN ?? process.env.SLACK_MCP_XOXP_TOKEN;
-  if (legacyEnvToken && names.length === 0) return legacyEnvToken;
+  if (legacyEnvToken && names.length === 0) return srcd(legacyEnvToken, process.env.SLACK_BOT_TOKEN ? "SLACK_BOT_TOKEN" : "SLACK_MCP_XOXP_TOKEN", "env");
   // A bot token (xoxb-) belongs in SLACK_BOT_TOKEN: it is how `slack ask` / --as-bot send, and
   // ~/.config/slack-cli/.env is its documented home. It never stands in for the user token, so it is
   // no conflict; warn only about a *user* token parked in the legacy variables.
@@ -292,7 +304,7 @@ export function resolveToken(workspaceFlag?: string): string {
   // Dir walk: only SLACK_TOKEN from env files can override profiles.
   // SLACK_BOT_TOKEN in .env files yields to profiles (same as shell env).
   const walked = walkDirEnv(process.cwd(), ["SLACK_TOKEN"]);
-  if (walked) return walked;
+  if (walked) return srcd(walked, "SLACK_TOKEN (from an env file above the current directory)", "env", names);
 
   // profiles.json via SLACK_WORKSPACE env var or lockfiles
   const selected = process.env.SLACK_WORKSPACE;
@@ -301,21 +313,21 @@ export function resolveToken(workspaceFlag?: string): string {
     if (!profile) {
       throw new Error(`Workspace "${selected}" not found. Available: ${names.join(", ") || "(none)"}`);
     }
-    return profile.token;
+    return srcd(profile.token, `profile "${selected}" (SLACK_WORKSPACE)`, "profile");
   }
 
   const localName = readLockfile(localLockfilePath());
   if (localName) {
     const profile = profiles[localName];
     if (!profile) throw new Error(`Workspace "${localName}" (from .slack-cli/workspace) not found in profiles.`);
-    return profile.token;
+    return srcd(profile.token, `profile "${localName}" (.slack-cli/workspace)`, "profile");
   }
 
   const globalName = readLockfile(globalLockfilePath());
   if (globalName) {
     const profile = profiles[globalName];
     if (!profile) throw new Error(`Workspace "${globalName}" (from ~/.slack-cli/workspace) not found in profiles.`);
-    return profile.token;
+    return srcd(profile.token, `profile "${globalName}" (~/.slack-cli/workspace)`, "profile");
   }
 
   if (names.length > 0) {
