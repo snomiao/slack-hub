@@ -14,6 +14,10 @@ on:
       - "rs/**"
       - "package.json"
       - ".github/workflows/rust-npm-release.yml"
+      # The proof that the binary behaves like the TypeScript, and what it runs on.
+      - "tests/parity.test.ts"
+      - "tests/mock.ts"
+      - "tests/slack-markdown.ts"
   workflow_dispatch:
     inputs:
       version:
@@ -29,8 +33,15 @@ jobs:
       bins: slack
       version: ${{ inputs.version }}
       js-build: bun install --frozen-lockfile && bun run build
-      # `--version` is answered by the binary itself. Every other command is
-      # still handed back to the JavaScript, so that path is checked as well.
+      # Every command the binary answers itself must behave exactly like the
+      # TypeScript: tests/parity.test.ts runs both against a mock Slack and
+      # compares everything they print, send and leave behind. It runs against
+      # the binary just built ($RUSTIFY_BIN_DIR/slack) and has to pass.
+      parity: bun install --frozen-lockfile && bun test tests/parity.test.ts
+      # `--version` and `search` are answered by the binary itself; search
+      # needs a token and Slack, so the parity job covers it. Every other
+      # command is still handed back to the JavaScript, checked here too.
       smoke: slack --version
       smoke-extra: |
         slack --help => slack <command>
+        slack search --help => slack search <query>
