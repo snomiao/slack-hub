@@ -70,9 +70,13 @@ pub fn run(entry: &str) -> ! {
             last_error = Some(command.exec());
         }
         #[cfg(not(unix))]
-        match command.status() {
-            Ok(status) => std::process::exit(status.code().unwrap_or(1)),
-            Err(err) => last_error = Some(err),
+        {
+            #[cfg(windows)]
+            stay_alive_on_ctrl_c();
+            match command.status() {
+                Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+                Err(err) => last_error = Some(err),
+            }
         }
     }
     eprintln!(
@@ -81,4 +85,25 @@ pub fn run(entry: &str) -> ! {
         last_error.map(|e| e.to_string()).unwrap_or_default()
     );
     std::process::exit(127);
+}
+
+/// Ctrl+C reaches every process attached to the console. Without a handler
+/// this process would end at once and hand the prompt back while the
+/// JavaScript is still shutting down. With one it waits, and exits with the
+/// child's exit code. A handler, unlike the "ignore Ctrl+C" flag, is not
+/// inherited, so the child still gets the key press.
+#[cfg(windows)]
+fn stay_alive_on_ctrl_c() {
+    extern "system" {
+        fn SetConsoleCtrlHandler(
+            handler: Option<unsafe extern "system" fn(u32) -> i32>,
+            add: i32,
+        ) -> i32;
+    }
+    unsafe extern "system" fn handled(_event: u32) -> i32 {
+        1
+    }
+    unsafe {
+        SetConsoleCtrlHandler(Some(handled), 1);
+    }
 }
