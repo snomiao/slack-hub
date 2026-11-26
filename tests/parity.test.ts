@@ -23,9 +23,10 @@
 // PARITY_SELF=1 runs the TypeScript against itself. Every case has to pass
 // that way first, or it compares something that is not deterministic.
 // PARITY_DUMP=<dir> writes both outcomes of every case there, for reading.
+// PARITY_TS=dist compares against the bundle users get (`bun run build` first).
 
 import { describe, test, expect } from "./harness.ts";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
@@ -62,8 +63,8 @@ type Setup = {
   files?: Record<string, string>;
   /** Added to the base environment; null removes a variable. */
   env?: Env;
-  /** The mock's fixtures (default: DEPLOY). */
-  fixtures?: InlineFixtures;
+  /** The mock's fixtures (default: DEPLOY); "recorded": tests/fixtures/mock/. */
+  fixtures?: InlineFixtures | "recorded";
 };
 type Case = Setup & {
   name: string;
@@ -108,7 +109,7 @@ function writeFiles(home: string, files: Record<string, string> | undefined, sub
 }
 
 type Impl = { cmd: string; args: string[] };
-const TS_IMPL: Impl = { cmd: "bun", args: [TS_ENTRY] };
+const TS_IMPL: Impl = { cmd: "bun", args: [process.env.PARITY_TS === "dist" ? join(ROOT, "dist", "cli.js") : TS_ENTRY] };
 const RS_IMPL: Impl = SELF ? TS_IMPL : { cmd: RUST_BIN, args: [] };
 
 async function run(impl: Impl, c: Setup & { args: string[] }, extraEnv: Env = {}): Promise<Outcome> {
@@ -116,7 +117,7 @@ async function run(impl: Impl, c: Setup & { args: string[] }, extraEnv: Env = {}
   const home = join(base, "home");
   const cwd = join(home, "work");
   mkdirSync(cwd, { recursive: true });
-  const mock = await startMock({ inline: c.fixtures ?? DEPLOY });
+  const mock = await startMock(c.fixtures === "recorded" ? {} : { inline: c.fixtures ?? DEPLOY });
   const subst = (s: string): string => s.replaceAll("{home}", home).replaceAll("{base}", base).replaceAll("{mock}", mock.baseUrl);
   try {
     writeFiles(home, c.files, subst);
@@ -292,6 +293,14 @@ const SEARCH: Case[] = [
   { name: "search: an empty query", args: ["search", ""] },
   { name: "search: a numeric query stays a string", args: ["search", "123"], fixtures: ONE() },
   { name: "search: no matches", args: ["search", "deploy"], fixtures: { "search.messages": page([]) } },
+  { name: "search deploy --count 10, on the recorded fixtures", args: ["search", "deploy", "--count", "10"], fixtures: "recorded", check: has("stdout", "deploy") },
+  {
+    // Promise.all: both forwarded messages look the same person up at once,
+    // before either answer is in, so the TypeScript asks Slack twice.
+    name: "search: two attachments mention the same person", args: ["search", "deploy"],
+    fixtures: { ...USERS, ...AUTH, "search.messages": page([{ user: "U00000001", ts: "1700000000.000100", text: "fwd", channel: ch("general"), attachments: [{ is_share: true, text: "a <@U00000007>" }, { is_share: true, text: "b <@U00000007>" }] }]) },
+    check: (o) => expect(o.requests.filter((r) => r.method === "users.info" && r.params.user === "U00000007").length).toBe(2),
+  },
   {
     name: "search: odd shapes (ts as a number or missing, non-string user, string counts)", args: ["search", "deploy"],
     fixtures: {
@@ -531,6 +540,12 @@ const HANDED_BACK: Route[] = [
   { name: "BUN_OPTIONS", args: ["search", "q"], env: { BUN_OPTIONS: "--smol" } },
   { name: "a cache.json that is not JSON", args: ["search", "q"], files: { ".config/slack-cli/cache.json": "{nope" } },
   { name: "HOME unset", args: ["search", "q"], env: { HOME: null } },
+  // How bun's fetch and Rust's HTTP client read these is not proven the same.
+  { name: "HTTPS_PROXY", args: ["search", "q"], env: { HTTPS_PROXY: "http://127.0.0.1:9" } },
+  { name: "no_proxy", args: ["search", "q"], env: { no_proxy: "*" } },
+  { name: "a proxy in a dotenv file", args: ["search", "q"], files: { ".config/slack-cli/.env": "HTTP_PROXY=http://127.0.0.1:9\n" } },
+  { name: "NODE_EXTRA_CA_CERTS", args: ["search", "q"], env: { NODE_EXTRA_CA_CERTS: "/nonexistent.pem" } },
+  { name: "NODE_TLS_REJECT_UNAUTHORIZED in a dotenv file", args: ["search", "q"], files: { ".config/slack-cli/.env": "NODE_TLS_REJECT_UNAUTHORIZED=0\n" } },
   // Responses the JavaScript would fail on with the runtime's own message.
   // Nothing is printed before it, so the JavaScript simply runs the search again.
   { name: "a body that is not JSON", args: ["search", "q"], fixtures: { "search.messages": { __raw: "<html>bad gateway</html>" } }, requests: "some" },
@@ -603,6 +618,82 @@ describe.skipIf(!ENABLED || SELF)("parity: what the binary hands back to the Jav
       }
     });
   }
+});
+
+// ─────────────────────── terminals and closed pipes ───────────────────────
+// The runs above have no terminal. On one, bun prints console.error in red
+// (unless NO_COLOR is set), so the binary has to as well; python3's pty module
+// gives both implementations the same terminal on Linux and macOS. And a reader
+// that goes away mid-output makes the CLI exit 141, like a shell's SIGPIPE.
+
+const PTY = [
+  "import os, pty, sys",
+  "pid, fd = pty.fork()",
+  "if pid == 0:",
+  "    os.execvp(sys.argv[1], sys.argv[1:])",
+  "out = bytearray()",
+  "while True:",
+  "    try:",
+  "        b = os.read(fd, 65536)",
+  "    except OSError:",
+  "        break",
+  "    if not b:",
+  "        break",
+  "    out += b",
+  "_, status = os.waitpid(pid, 0)",
+  "sys.stdout.buffer.write(bytes(out))",
+  "sys.exit(os.waitstatus_to_exitcode(status) % 256)",
+].join("\n");
+const HAVE_PTY = process.platform !== "win32" && spawnSync("python3", ["-I", "-B", "-c", "import pty"]).status === 0;
+// -I -B: python itself must leave nothing in HOME (bytecode caches).
+const onTerminal = (impl: Impl): Impl => ({ cmd: "python3", args: ["-I", "-B", "-c", PTY, impl.cmd, ...impl.args] });
+
+const TERMINAL: Case[] = [
+  { name: "terminal: an error is red, as bun's console.error prints it", args: ["search", "deploy"], env: { SLACK_TOKEN: null }, check: has("stdout", "\x1b[31mNo Slack token found") },
+  { name: "terminal: NO_COLOR=1", args: ["search", "deploy"], env: { SLACK_TOKEN: null, NO_COLOR: "1" }, check: (o) => expect(o.stdout).not.toContain("\x1b[") },
+  { name: "terminal: an empty NO_COLOR still colours", args: ["search", "deploy"], env: { SLACK_TOKEN: null, NO_COLOR: "" } },
+  { name: "terminal: search output", args: ["search", "deploy"], check: has("stdout", "↪ shared message") },
+  {
+    name: "terminal: a warning, then the results", args: ["search", "deploy", "-n", "2"],
+    env: { SLACK_TOKEN: null, SLACK_MCP_XOXP_TOKEN: "xoxp-legacy" }, files: { ...PROFILES_FILE, ".slack-cli/workspace": "other" }, check: has("stdout", "Warning:"),
+  },
+];
+
+const BIG: InlineFixtures = {
+  ...USERS, ...AUTH,
+  "search.messages": page(Array.from({ length: 100 }, (_, i) => ({ user: "U00000001", ts: `17000000${String(i).padStart(2, "0")}.000100`, text: `${"x".repeat(4000)} ${i}`, channel: ch("general") }))),
+};
+
+describe.skipIf(!ENABLED || !HAVE_PTY)("parity: on a terminal", () => {
+  for (const c of TERMINAL) {
+    test(c.name, { timeout: 60_000 }, async () => {
+      const tsOut = await run(onTerminal(TS_IMPL), c);
+      c.check?.(tsOut);
+      const rsOut = await run(onTerminal(RS_IMPL), c);
+      dump(c.name, { ts: tsOut, rs: rsOut });
+      expect(rsOut).toEqual(tsOut);
+    });
+  }
+});
+
+// A real pipe, as a shell gives one: the writer always sees EPIPE. (Node and
+// bun give a child's stdio a socket pair instead, where the error is EPIPE or
+// ENOTCONN depending on timing — for both implementations alike — so that
+// cannot be compared run against run.)
+const piped = (impl: Impl): Impl => ({
+  cmd: "bash",
+  args: ["-c", '"$@" | head -c 100 > /dev/null; echo "exit ${PIPESTATUS[0]}" >&2', "piped", impl.cmd, ...impl.args],
+});
+
+describe.skipIf(!ENABLED || process.platform === "win32")("parity: a reader that goes away", () => {
+  test("stdout piped into `head -c 100`: exit 141, nothing else on stderr", { timeout: 60_000 }, async () => {
+    const c: Case = { name: "closed pipe", args: ["search", "deploy"], fixtures: BIG };
+    const pick = (o: Outcome) => ({ exit: o.exit, stderr: o.stderr });
+    const tsOut = await run(piped(TS_IMPL), c);
+    expect(tsOut.stderr).toBe("exit 141\n");
+    const rsOut = await run(piped(RS_IMPL), c);
+    expect(pick(rsOut)).toEqual(pick(tsOut));
+  });
 });
 
 describe.skipIf(ENABLED)("parity (no Rust binary)", () => {
