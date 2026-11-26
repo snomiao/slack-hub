@@ -1,3 +1,4 @@
+mod js_fallback;
 mod slack;
 
 use anyhow::Result;
@@ -176,8 +177,25 @@ enum Cmd {
     },
 }
 
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Same output as the JavaScript CLI's `--version`.
+    if args == ["--version"] {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    // Installed from npm, this binary is the `slack` command, but the
+    // JavaScript CLI is still the reference: the commands below differ from it
+    // and are not at parity yet. Until they are, hand everything else back.
+    // SLACK_HUB_NATIVE=1 runs the Rust commands anyway, for comparing the two.
+    if std::env::var_os("SLACK_HUB_NATIVE").is_none() && js_fallback::package_root().is_some() {
+        js_fallback::run("dist/cli.js");
+    }
+    run()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn run() -> Result<()> {
     // Load env: XDG config first, then local .env
     if let Some(home) = std::env::var_os("HOME") {
         dotenvy::from_filename(std::path::Path::new(&home).join(".config/slack-cli/.env")).ok();
