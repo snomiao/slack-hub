@@ -9,9 +9,10 @@
 
 use crate::api::{Api, Fail};
 use crate::cache::Cache;
-use crate::config::{Config, HandBack};
-use crate::msgfmt::{self, Fmt};
-use crate::{js, newlines, out};
+use crate::cli::{self, Kind, Opt, GLOBAL};
+use crate::config::Config;
+use crate::msgfmt::Fmt;
+use crate::{js, out};
 use serde_json::{Map, Value};
 
 struct Opts {
@@ -21,59 +22,18 @@ struct Opts {
     workspace: Option<String>,
 }
 
+const COUNT: Opt = Opt { names: &["--count", "-n"], kind: Kind::Number };
+const JSON: Opt = Opt { names: &["--json"], kind: Kind::Flag };
+
 /// The argument shapes answered natively. `None` hands the invocation back.
 fn parse(args: &[String]) -> Option<Opts> {
-    let (mut query, mut count, mut json, mut workspace, mut as_user) = (None, None, false, None, false);
-    let count_value = |v: &str| -> Option<usize> {
-        let ok = v == "0" || (!v.starts_with('0') && (1..=9).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_digit()));
-        ok.then(|| v.parse().ok()).flatten()
-    };
-    let workspace_value = |v: &str| (!v.is_empty() && !v.starts_with('-')).then(|| v.to_string());
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i].as_str();
-        let next = args.get(i + 1).map(String::as_str);
-        match a {
-            // yargs reads a following `true`/`false` as a boolean flag's value.
-            "--json" | "--as-user" if matches!(next, Some("true" | "false")) => return None,
-            "--json" if !json => json = true,
-            "--as-user" if !as_user => as_user = true,
-            "--count" | "-n" if count.is_none() => {
-                count = Some(count_value(next?)?);
-                i += 1;
-            }
-            "-w" | "--workspace" if workspace.is_none() => {
-                workspace = Some(workspace_value(next?)?);
-                i += 1;
-            }
-            _ if a.starts_with("--count=") && count.is_none() => count = Some(count_value(&a[8..])?),
-            _ if a.starts_with("--workspace=") && workspace.is_none() => workspace = Some(workspace_value(&a[12..])?),
-            _ if a.starts_with('-') => return None,
-            _ if query.is_none() => query = Some(a.to_string()),
-            _ => return None,
-        }
-        i += 1;
-    }
-    Some(Opts { query: query?, count: count.unwrap_or(100), json, workspace })
-}
-
-fn hand_back_on<T>(r: Result<T, HandBack>) -> T {
-    r.unwrap_or_else(|HandBack| out::hand_back())
-}
-
-/// The error a yargs command handler threw: its message, exit 1.
-fn fail(message: &str) -> ! {
-    out::err(message);
-    out::exit(1)
-}
-
-/// ts/slack.ts searchPage, with the newline repair at the fetch.
-fn search_page(api: &Api, token: &str, query: &str, page: usize, cookie: Option<&str>) -> Result<Value, Fail> {
-    let page = page.to_string();
-    let params = [("query", query), ("sort", "timestamp"), ("sort_dir", "desc"), ("count", "100"), ("page", page.as_str())];
-    let mut resp = api.get(token, "search.messages", &params, cookie)?;
-    newlines::repair_messages(&mut resp).map_err(|HandBack| Fail::HandBack)?;
-    Ok(resp)
+    let p = cli::parse(args, &[&COUNT, &JSON, &GLOBAL[0], &GLOBAL[1]], 1)?;
+    Some(Opts {
+        query: p.positionals.into_iter().next()?,
+        count: p.values[0].as_deref().map_or(Some(100), |v| v.parse().ok())?,
+        json: p.values[1].is_some(),
+        workspace: p.values[2].clone(),
+    })
 }
 
 /// ts/slack.ts searchAll: pages of 100 until `max` matches, the last page or
@@ -83,7 +43,7 @@ fn search_all(api: &Api, token: &str, query: &str, max: usize, cookie: Option<&s
     let mut all: Vec<Value> = Vec::new();
     let mut last;
     loop {
-        let resp = search_page(api, token, query, page, cookie)?;
+        let resp = cli::search_page(api, token, query, page, cookie)?;
         let messages = js::get(Some(&resp), "messages");
         let arr = js::array(js::get(messages, "matches")).to_vec();
         let got = arr.len();
@@ -114,11 +74,11 @@ fn search_all(api: &Api, token: &str, query: &str, max: usize, cookie: Option<&s
 
 pub fn run(args: &[String]) -> ! {
     let Some(opts) = parse(&args[1..]) else { out::hand_back() };
-    let cfg = hand_back_on(Config::load(opts.workspace.as_deref()));
+    let cfg = cli::hand_back_on(Config::load(opts.workspace.as_deref()));
     let ws = opts.workspace.as_deref();
-    let token = match hand_back_on(cfg.resolve_token(ws)) {
+    let token = match cli::hand_back_on(cfg.resolve_token(ws)) {
         Ok(t) => t,
-        Err(message) => fail(&message),
+        Err(message) => cli::fail(&message),
     };
     let cookie = cfg.resolve_cookie(ws);
     let api = match Api::new(&cfg) {
@@ -134,10 +94,10 @@ pub fn run(args: &[String]) -> ! {
         Err(e) => {
             let msg = e.message();
             if !(token.starts_with("xoxb-") && msg.contains("not_allowed_token_type")) {
-                fail(&msg);
+                cli::fail(&msg);
             }
             let Some((name, profile)) = cfg.user_token_profile(&token) else {
-                fail("Error: search requires a user token (xoxp-/xoxc-) — the active profile is a bot token (xoxb-), which Slack rejects for search.messages.\n  Add a user-token profile:  slack auth login   (or slack auth login --token <token>)\n  Then select it:            slack auth use <name>   (or pass --workspace <name>)");
+                cli::fail("Error: search requires a user token (xoxp-/xoxc-) — the active profile is a bot token (xoxb-), which Slack rejects for search.messages.\n  Add a user-token profile:  slack auth login   (or slack auth login --token <token>)\n  Then select it:            slack auth use <name>   (or pass --workspace <name>)");
             };
             out::err(&format!("Note: search.messages needs a user token — the active profile is a bot token (xoxb-); falling back to profile \"{name}\"."));
             search_token = profile.token;
@@ -145,7 +105,7 @@ pub fn run(args: &[String]) -> ! {
             match search_all(&api, &search_token, &opts.query, opts.count, search_cookie.as_deref()) {
                 Ok(r) => r,
                 Err(Fail::HandBack) => out::hand_back(),
-                Err(e) => fail(&e.message()),
+                Err(e) => cli::fail(&e.message()),
             }
         }
     };
@@ -155,33 +115,11 @@ pub fn run(args: &[String]) -> ! {
         out::exit(0);
     }
     let matches: Vec<Value> = js::array(js::get(js::get(Some(&resp), "messages"), "matches")).to_vec();
-    // An id the TypeScript would put into a RegExp it cannot build: answered
-    // there, before anything is printed here.
-    for m in &matches {
-        let raw = js::get(Some(m), "text").and_then(Value::as_str).map(str::to_string);
-        let texts = raw.into_iter().chain(msgfmt::parse_attachments(m).into_iter().map(|a| a.text));
-        if texts.flat_map(|t| msgfmt::mention_ids(&t)).any(|id| !msgfmt::regex_safe(&id)) {
-            out::hand_back();
-        }
-    }
+    cli::check_mentions(&matches);
     let mut fmt = Fmt::new(&api, Cache::new(cfg.home().join(".config").join("slack-cli").join("cache.json")));
     let cookie = search_cookie.as_deref();
     for m in &matches {
-        let ch = js::get(Some(m), "channel");
-        let is_im = js::get(ch, "is_im") == Some(&Value::Bool(true));
-        let raw_name = js::get(ch, "name").and_then(Value::as_str).unwrap_or("dm");
-        let label = if is_im && raw_name.starts_with('U') {
-            let key = format!("@{raw_name}");
-            if !fmt.mem.contains_key(&key) {
-                let h = fmt.user_handle(&search_token, raw_name, cookie);
-                fmt.mem.insert(key.clone(), h);
-            }
-            format!("@{}", js::to_string(js::coalesce(fmt.mem.get(&key), Some(&Value::String(raw_name.to_string())))))
-        } else if is_im {
-            format!("@{raw_name}")
-        } else {
-            format!("#{raw_name}")
-        };
+        let label = cli::channel_label(&mut fmt, &search_token, m, cookie);
         let line = fmt.line(&search_token, m, Some(&label), cookie);
         out::out(&line);
     }
