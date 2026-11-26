@@ -164,11 +164,11 @@ impl<'a> Api<'a> {
     }
 }
 
-/// `setTimeout(r, ms)`: a delay under 1 ms (or not a number) is next tick.
+/// `setTimeout(r, ms)`: a delay under 1 ms, past 2^31-1 ms or not a number
+/// is 1 ms.
 fn sleep_ms(ms: f64) {
-    if ms >= 1.0 && ms.is_finite() {
-        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
-    }
+    let ms = if (1.0..=2_147_483_647.0).contains(&ms) { ms as u64 } else { 1 };
+    std::thread::sleep(std::time::Duration::from_millis(ms));
 }
 
 #[cfg(test)]
