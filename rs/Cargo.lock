@@ -1215,7 +1215,6 @@ dependencies = [
  "chrono",
  "clap",
  "dotenvy",
- "libc",
  "reqwest",
  "ring",
  "serde_json",

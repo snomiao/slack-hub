@@ -6,13 +6,14 @@ use chrono::{Datelike, TimeZone};
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::io::IsTerminal;
 
 fn is_interactive() -> bool {
-    unsafe { libc::isatty(libc::STDERR_FILENO) == 1 }
+    std::io::stderr().is_terminal()
 }
 
 fn is_stdout_tty() -> bool {
-    unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
+    std::io::stdout().is_terminal()
 }
 
 fn slack_ts_to_local(ts_str: &str) -> chrono::DateTime<chrono::Local> {
