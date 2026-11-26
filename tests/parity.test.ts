@@ -23,7 +23,9 @@
 // PARITY_SELF=1 runs the TypeScript against itself. Every case has to pass
 // that way first, or it compares something that is not deterministic.
 // PARITY_DUMP=<dir> writes both outcomes of every case there, for reading.
-// PARITY_TS=dist compares against the bundle users get (`bun run build` first).
+// PARITY_TS=dist compares against the bundle dist/cli.js instead (`bun run
+// build` first). It ships in the package, but the published `slack` runs
+// ts/cli.ts: npm does not apply publishConfig.bin.
 
 import { describe, test, expect } from "./harness.ts";
 import { spawn, spawnSync } from "node:child_process";
@@ -481,8 +483,10 @@ const SEARCH: Case[] = [
   { name: "cache: a cache.json that cannot be written", args: ["search", "deploy"], files: { ".config/slack-cli/cache.json/": "" } },
 ];
 
-// Every invocation here must reach the JavaScript exactly as typed. The
-// package root's dist/cli.js only prints its arguments.
+// Every invocation here must reach the JavaScript exactly as typed, and the
+// file the published `slack` runs: ts/cli.ts, under bun. The package root's
+// ts/cli.ts only prints its arguments and runtime; its dist/cli.js, a decoy,
+// fails.
 type Route = Setup & { name: string; args: string[]; native?: false; requests?: "none" | "some" };
 const HANDED_BACK: Route[] = [
   { name: "no arguments", args: [] },
@@ -588,9 +592,11 @@ describe.skipIf(!ENABLED)("parity: TypeScript against Rust", () => {
 describe.skipIf(!ENABLED || SELF)("parity: what the binary hands back to the JavaScript", () => {
   const pkg = (): string => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "slack-parity-pkg-")));
+    mkdirSync(join(root, "ts"));
     mkdirSync(join(root, "dist"));
     writeFileSync(join(root, "package.json"), JSON.stringify({ name: "slack-hub" }));
-    writeFileSync(join(root, "dist", "cli.js"), "console.log(JSON.stringify({ handedBack: process.argv.slice(2) }));\n");
+    writeFileSync(join(root, "ts", "cli.ts"), 'console.log(JSON.stringify({ handedBack: process.argv.slice(2), runtime: typeof Bun === "undefined" ? "node" : "bun" }));\n');
+    writeFileSync(join(root, "dist", "cli.js"), 'console.error("handed back to dist/cli.js, not ts/cli.ts"); process.exit(3);\n');
     return root;
   };
   for (const r of HANDED_BACK) {
@@ -598,7 +604,7 @@ describe.skipIf(!ENABLED || SELF)("parity: what the binary hands back to the Jav
       const root = pkg();
       try {
         const out = await run(RS_IMPL, r, { SLACK_HUB_PACKAGE_ROOT: root });
-        expect({ stdout: out.stdout, stderr: out.stderr, exit: out.exit }).toEqual({ stdout: `${JSON.stringify({ handedBack: r.args })}\n`, stderr: "", exit: 0 });
+        expect({ stdout: out.stdout, stderr: out.stderr, exit: out.exit }).toEqual({ stdout: `${JSON.stringify({ handedBack: r.args, runtime: "bun" })}\n`, stderr: "", exit: 0 });
         if (r.requests === "some") expect(out.requests.length).toBeGreaterThan(0);
         else if (r.fixtures === undefined) expect(out.requests).toEqual([]);
       } finally {
