@@ -138,7 +138,11 @@ export async function startMock(
       res.setHeader("Content-Type", "application/json");
       if (retryAfterHdr !== null) res.setHeader("retry-after", retryAfterHdr);
       for (const [hk, hv] of Object.entries(extraHeaders)) res.setHeader(hk, String(hv));
-      res.end(JSON.stringify(body));
+      // `{ __raw: "<text>" }` sends that text as the body, byte for byte: JSON
+      // a JS object literal cannot spell (`1.0`, integers past 2^53, keys out
+      // of JS order), or a body that is not JSON at all.
+      const raw = body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>).__raw : undefined;
+      res.end(typeof raw === "string" ? raw : JSON.stringify(body));
     };
 
     if (req.method === "POST") {
