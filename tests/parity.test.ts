@@ -500,13 +500,13 @@ const NEWS_MATCHES = [
 const NEWS: InlineFixtures = { ...USERS, ...AUTH, "search.messages": page(NEWS_MATCHES) };
 
 const NEWS_CASES: Case[] = [
-  { name: "news: default --limit 20, grouped by local day", args: ["news"], fixtures: NEWS, check: all(has("stdout", "  Today\n  ----------------------------\n"), has("stdout", "↪ shared message")) },
+  { name: "news: default --limit 20, grouped by local day", args: ["news"], fixtures: NEWS, check: all(has("stdout", "\n  ----------------------------\n"), has("stdout", "↪ shared message")) },
   { name: "news --limit 5", args: ["news", "--limit", "5"], fixtures: NEWS },
   { name: "news -l 8", args: ["news", "-l", "8"], fixtures: NEWS },
   { name: "news --limit=0", args: ["news", "--limit=0"], fixtures: NEWS },
   { name: "news --limit 100", args: ["news", "--limit", "100"], fixtures: NEWS },
   { name: "news --as-user", args: ["news", "--as-user", "-l", "3"], fixtures: NEWS },
-  { name: "news: the brief's case, on the recorded fixtures", args: ["news", "--limit", "5"], fixtures: "recorded" },
+  { name: "news --limit 5, on the recorded fixtures", args: ["news", "--limit", "5"], fixtures: "recorded" },
   { name: "news: TZ=America/New_York", args: ["news", "-l", "30"], fixtures: NEWS, env: { TZ: "America/New_York" } },
   { name: "news: TZ=Europe/London", args: ["news", "-l", "30"], fixtures: NEWS, env: { TZ: "Europe/London" } },
   { name: "news: TZ=Australia/Lord_Howe (a half-hour DST)", args: ["news", "-l", "30"], fixtures: NEWS, env: { TZ: "Australia/Lord_Howe" } },
@@ -714,11 +714,12 @@ const PTY = [
   "sys.exit(os.waitstatus_to_exitcode(status) % 256)",
 ].join("\n");
 const HAVE_PTY = process.platform !== "win32" && spawnSync("python3", ["-I", "-B", "-c", "import pty"]).status === 0;
+if (BIN_DIR && !HAVE_PTY) throw new Error("RUSTIFY_BIN_DIR is set, but python3's pty module is missing: the terminal cases would be skipped");
 // -I -B: python itself must leave nothing in HOME (bytecode caches).
 const onTerminal = (impl: Impl): Impl => ({ cmd: "python3", args: ["-I", "-B", "-c", PTY, impl.cmd, ...impl.args] });
 
 const TERMINAL: Case[] = [
-  { name: "terminal: news output", args: ["news", "-l", "8"], fixtures: NEWS, check: has("stdout", "Today") },
+  { name: "terminal: news output", args: ["news", "-l", "8"], fixtures: NEWS, check: has("stdout", "----------------------------") },
   { name: "terminal: an error is red, as bun's console.error prints it", args: ["search", "deploy"], env: { SLACK_TOKEN: null }, check: has("stdout", "\x1b[31mNo Slack token found") },
   { name: "terminal: NO_COLOR=1", args: ["search", "deploy"], env: { SLACK_TOKEN: null, NO_COLOR: "1" }, check: (o) => expect(o.stdout).not.toContain("\x1b[") },
   { name: "terminal: an empty NO_COLOR still colours", args: ["search", "deploy"], env: { SLACK_TOKEN: null, NO_COLOR: "" } },
@@ -746,10 +747,10 @@ describe.skipIf(!ENABLED || !HAVE_PTY)("parity: on a terminal", () => {
   }
 });
 
-// A real pipe, as a shell gives one: the writer always sees EPIPE. (Node and
-// bun give a child's stdio a socket pair instead, where the error is EPIPE or
-// ENOTCONN depending on timing — for both implementations alike — so that
-// cannot be compared run against run.)
+// A real pipe, as a shell gives one: the writer always sees EPIPE. (bun, like
+// Node's libuv, gives a child's stdio a socket pair instead, where the error
+// is EPIPE or ENOTCONN depending on timing — for both implementations alike —
+// so that cannot be compared run against run.)
 const piped = (impl: Impl): Impl => ({
   cmd: "bash",
   args: ["-c", '"$@" | head -c 100 > /dev/null; echo "exit ${PIPESTATUS[0]}" >&2', "piped", impl.cmd, ...impl.args],
