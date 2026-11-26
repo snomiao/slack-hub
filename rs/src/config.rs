@@ -67,6 +67,13 @@ const BUN_ENV_FILES: &[&str] = &[
     ".env.development.local", ".env.production.local", ".env.test.local", "bunfig.toml",
 ];
 
+/// Proxy and certificate settings. bun's fetch and Rust's HTTP client do not
+/// read them the same way (or at all, when only a dotenv file sets them).
+const NET_VARS: &[&str] = &[
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED", "NODE_USE_SYSTEM_CA", "SSL_CERT_FILE", "SSL_CERT_DIR",
+];
+
 /// One profile of profiles.json, as far as reading a token needs it.
 #[derive(Clone)]
 pub struct Profile {
@@ -186,6 +193,9 @@ impl Config {
                     }
                 }
             }
+        }
+        if NET_VARS.iter().any(|k| env.get(k).is_some()) {
+            return Err(HandBack);
         }
         let mut cfg = Config {
             start_env,

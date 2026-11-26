@@ -25,20 +25,27 @@ thread_local! {
     static STATE: RefCell<State> = const { RefCell::new(State { held: Some(Vec::new()) }) };
 }
 
+/// The error's code as Node names it (`err.code`): the errno's symbol.
 fn errno_name(e: &std::io::Error) -> String {
-    let name = match e.raw_os_error() {
-        Some(5) => "EIO",
-        Some(9) => "EBADF",
-        Some(22) => "EINVAL",
-        Some(27) => "EFBIG",
-        Some(28) => "ENOSPC",
-        #[cfg(target_os = "linux")]
-        Some(122) => "EDQUOT",
-        #[cfg(target_os = "macos")]
-        Some(69) => "EDQUOT",
-        _ => return e.to_string(),
-    };
-    name.to_string()
+    #[cfg(target_os = "linux")]
+    const NAMES: &[(i32, &str)] = &[
+        (1, "EPERM"), (2, "ENOENT"), (4, "EINTR"), (5, "EIO"), (6, "ENXIO"), (9, "EBADF"), (11, "EAGAIN"), (12, "ENOMEM"),
+        (13, "EACCES"), (14, "EFAULT"), (16, "EBUSY"), (22, "EINVAL"), (27, "EFBIG"), (28, "ENOSPC"), (29, "ESPIPE"),
+        (30, "EROFS"), (32, "EPIPE"), (88, "ENOTSOCK"), (100, "ENETDOWN"), (103, "ECONNABORTED"), (104, "ECONNRESET"),
+        (107, "ENOTCONN"), (108, "ESHUTDOWN"), (110, "ETIMEDOUT"), (113, "EHOSTUNREACH"), (122, "EDQUOT"),
+    ];
+    #[cfg(target_os = "macos")]
+    const NAMES: &[(i32, &str)] = &[
+        (1, "EPERM"), (2, "ENOENT"), (4, "EINTR"), (5, "EIO"), (6, "ENXIO"), (9, "EBADF"), (12, "ENOMEM"), (13, "EACCES"),
+        (14, "EFAULT"), (16, "EBUSY"), (22, "EINVAL"), (27, "EFBIG"), (28, "ENOSPC"), (29, "ESPIPE"), (30, "EROFS"),
+        (32, "EPIPE"), (35, "EAGAIN"), (38, "ENOTSOCK"), (50, "ENETDOWN"), (53, "ECONNABORTED"), (54, "ECONNRESET"),
+        (57, "ENOTCONN"), (58, "ESHUTDOWN"), (60, "ETIMEDOUT"), (65, "EHOSTUNREACH"), (69, "EDQUOT"),
+    ];
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    const NAMES: &[(i32, &str)] = &[];
+    e.raw_os_error()
+        .and_then(|n| NAMES.iter().find(|(k, _)| *k == n))
+        .map_or_else(|| e.to_string(), |(_, name)| (*name).to_string())
 }
 
 fn write_all(fd: i32, bytes: &[u8]) {
