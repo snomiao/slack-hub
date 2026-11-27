@@ -89,5 +89,12 @@
     "@cloudflare/workers-types": {
       "optional": true
     }
+  },
+  "rustify": {
+    "mode": "hybrid",
+    "bins": {
+      "slack": "slack"
+    },
+    "rootEnv": "SLACK_HUB_PACKAGE_ROOT"
   }
 }

@@ -1,0 +1,36 @@
+# Builds the Rust `slack` binary for every platform, packs it together with
+# the JavaScript the package still ships, and checks on Linux, macOS and
+# Windows (x64 and arm64) that `bun i -g` / `npm i -g` gives a working command.
+#
+# It does not publish. Releases still go through release.yml.
+#
+# The pipeline lives in https://github.com/snomiao/rustify.
+
+name: rust-npm-release
+
+on:
+  pull_request:
+    paths:
+      - "rs/**"
+      - "package.json"
+      - ".github/workflows/rust-npm-release.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, without a leading v (default: the version in rs/Cargo.toml)"
+        required: false
+        type: string
+
+jobs:
+  build:
+    uses: snomiao/rustify/.github/workflows/rust-npm-build.yml@releases/v1
+    with:
+      manifest: rs/Cargo.toml
+      bins: slack
+      version: ${{ inputs.version }}
+      js-build: bun install --frozen-lockfile && bun run build
+      # `--version` is answered by the binary itself. Every other command is
+      # still handed back to the JavaScript, so that path is checked as well.
+      smoke: slack --version
+      smoke-extra: |
+        slack --help => slack <command>

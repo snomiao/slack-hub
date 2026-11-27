@@ -1,3 +1,4 @@
+mod js_fallback;
 mod slack;
 
 use anyhow::Result;
@@ -5,13 +6,14 @@ use chrono::{Datelike, TimeZone};
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::io::IsTerminal;
 
 fn is_interactive() -> bool {
-    unsafe { libc::isatty(libc::STDERR_FILENO) == 1 }
+    std::io::stderr().is_terminal()
 }
 
 fn is_stdout_tty() -> bool {
-    unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
+    std::io::stdout().is_terminal()
 }
 
 fn slack_ts_to_local(ts_str: &str) -> chrono::DateTime<chrono::Local> {
@@ -176,8 +178,28 @@ enum Cmd {
     },
 }
 
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Same output as the JavaScript CLI's `--version`.
+    if args == ["--version"] {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    // Installed from npm, this binary is the `slack` command, but the
+    // JavaScript CLI is still the reference: the commands below differ from it
+    // and are not at parity yet. Until they are, hand everything else back.
+    // SLACK_HUB_NATIVE=1 runs the Rust commands anyway, for comparing the two.
+    if std::env::var_os("SLACK_HUB_NATIVE").is_none() && js_fallback::package_root().is_some() {
+        // ts/cli.ts, not dist/cli.js: it is what the published package runs.
+        // npm does not apply publishConfig.bin, so `bin` (ts/cli.ts) is the
+        // command users have today; the bundle only ships alongside.
+        js_fallback::run("ts/cli.ts");
+    }
+    run()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn run() -> Result<()> {
     // Load env: XDG config first, then local .env
     if let Some(home) = std::env::var_os("HOME") {
         dotenvy::from_filename(std::path::Path::new(&home).join(".config/slack-cli/.env")).ok();
