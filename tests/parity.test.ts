@@ -483,6 +483,58 @@ const SEARCH: Case[] = [
   { name: "cache: a cache.json that cannot be written", args: ["search", "deploy"], files: { ".config/slack-cli/cache.json/": "" } },
 ];
 
+// `news`: search.messages `to:me`, grouped by LOCAL day relative to now
+// (ts/format.ts dayLabel). The fixtures are made once, relative to the time
+// this file loads, so both implementations see the same messages; each run
+// labels them against its own clock (seconds apart).
+const NOW = Math.floor(Date.now() / 1000);
+const ago = (sec: number): string => `${NOW - sec}.${String(100 + (sec % 900)).padStart(6, "0")}`;
+const NEWS_MATCHES = [
+  ...DEPLOY_MATCHES.slice(0, 6).map((m, i) => ({ ...m, ts: ago(60 + i * 1800) })),
+  { type: "message", user: "U00000002", ts: ago(86_400 + 120), text: "a day ago <@U00000001>", channel: ch("random") },
+  { type: "message", user: "U00000001", ts: ago(86_400 + 7_200), text: "a day and two hours ago", channel: ch("general"), reply_count: 2 },
+  { type: "message", user: "U00000004", ts: ago(3 * 86_400), text: "three days ago", channel: { id: "D00000001", is_im: true, name: "U00000003" } },
+  { type: "message", user: "U00000004", ts: ago(3 * 86_400 + 3_600), text: "three days and an hour ago", channel: ch("general") },
+  { type: "message", user: "U00000002", ts: ago(40 * 86_400), text: "forty days ago", channel: ch("general") },
+  { type: "message", user: "U00000002", ts: ago(400 * 86_400), text: "over a year ago", channel: ch("general") },
+  ...DEPLOY_MATCHES.slice(6).map((m, i) => ({ ...m, ts: ago(500 * 86_400 + i * 60) })),
+];
+const NEWS: InlineFixtures = { ...USERS, ...AUTH, "search.messages": page(NEWS_MATCHES) };
+
+const NEWS_CASES: Case[] = [
+  { name: "news: default --limit 20, grouped by local day", args: ["news"], fixtures: NEWS, check: all(has("stdout", "\n  ----------------------------\n"), has("stdout", "↪ shared message")) },
+  { name: "news --limit 5", args: ["news", "--limit", "5"], fixtures: NEWS },
+  { name: "news -l 8", args: ["news", "-l", "8"], fixtures: NEWS },
+  { name: "news --limit=0", args: ["news", "--limit=0"], fixtures: NEWS },
+  { name: "news --limit 100", args: ["news", "--limit", "100"], fixtures: NEWS },
+  { name: "news --as-user", args: ["news", "--as-user", "-l", "3"], fixtures: NEWS },
+  { name: "news --limit 5, on the recorded fixtures", args: ["news", "--limit", "5"], fixtures: "recorded" },
+  { name: "news: TZ=America/New_York", args: ["news", "-l", "30"], fixtures: NEWS, env: { TZ: "America/New_York" } },
+  { name: "news: TZ=Europe/London", args: ["news", "-l", "30"], fixtures: NEWS, env: { TZ: "Europe/London" } },
+  { name: "news: TZ=Australia/Lord_Howe (a half-hour DST)", args: ["news", "-l", "30"], fixtures: NEWS, env: { TZ: "Australia/Lord_Howe" } },
+  { name: "news: TZ=Asia/Kolkata", args: ["news", "-l", "30"], fixtures: NEWS, env: { TZ: "Asia/Kolkata" } },
+  { name: "news: TZ=Pacific/Kiritimati (UTC+14)", args: ["news", "-l", "30"], fixtures: NEWS, env: { TZ: "Pacific/Kiritimati" } },
+  { name: "news: TZ=UTC", args: ["news", "-l", "30"], fixtures: NEWS, env: { TZ: "UTC" } },
+  { name: "news: TZ unset (the system's zone)", args: ["news", "-l", "30"], fixtures: NEWS, env: { TZ: null } },
+  { name: "news: no matches", args: ["news"], fixtures: { "search.messages": page([]) } },
+  { name: "news: a response without `messages`", args: ["news"], fixtures: { "search.messages": { ok: true } } },
+  {
+    name: "news: odd shapes (no ts, a ts that is not a number, not an object)", args: ["news"],
+    fixtures: { ...USERS, ...AUTH, "search.messages": page([{ user: "U00000001", text: "no ts", channel: ch("general") }, { ts: "abc", text: "bad ts" }, null, 7, { ts: NOW + 0.5, text: "numeric ts", user: "U00000002" }]) },
+  },
+  { name: "news: -w picks the profile's token", args: ["news", "-w", "other"], fixtures: NEWS, files: PROFILES_FILE },
+  { name: "news: -w names a missing profile", args: ["news", "-w", "gone"], files: PROFILES_FILE, check: exits(1) },
+  { name: "news: no token", args: ["news"], env: { SLACK_TOKEN: null }, check: has("stderr", "No Slack token found") },
+  { name: "news: xoxc- with SLACK_COOKIE", args: ["news", "-l", "3"], fixtures: NEWS, env: { SLACK_TOKEN: "xoxc-session", SLACK_COOKIE: "xoxd-env" } },
+  // cmdNews passes no cookie: the profile's is not used even with -w.
+  { name: "news: xoxc- profile via -w sends resolveCookie()'s cookie, not the profile's", args: ["news", "-w", "acme-alice", "-l", "3"], fixtures: NEWS, files: PROFILES_FILE },
+  { name: "news: xoxc- without a cookie, rejected", args: ["news"], env: { SLACK_TOKEN: "xoxc-session" }, fixtures: { "search.messages": { ok: false, error: "invalid_auth" } }, check: has("stderr", "Desktop app token") },
+  { name: "news: a bot token gets no fallback", args: ["news"], env: { SLACK_TOKEN: null }, files: { ...PROFILES_FILE, "work/.slack-cli/workspace": "acme-bot" }, fixtures: { "search.messages": { ok: false, error: "not_allowed_token_type" } }, check: exits(1) },
+  { name: "news: Slack's error", args: ["news"], fixtures: { "search.messages": { ok: false, error: "invalid_auth" } }, check: has("stderr", "query=to%3Ame") },
+  { name: "news: rate limited, then answered", args: ["news", "-l", "3"], fixtures: { ...NEWS, "search.messages": { __sequence: [{ __status: 429, __retryAfter: 0, ok: false }, page(NEWS_MATCHES)] } }, check: has("stderr", "— waiting") },
+  { name: "news: the lookup cache", args: ["news", "-l", "4"], fixtures: NEWS, files: { ".config/slack-cli/cache.json": JSON.stringify({ channels: {}, users: { "T00000001\tU00000001": { value: "alice-cached", expires: 99999999999999 } } }) } },
+];
+
 // Every invocation here must reach the JavaScript exactly as typed, and the
 // file the published `slack` runs: ts/cli.ts, under bun. The package root's
 // ts/cli.ts only prints its arguments and runtime; its dist/cli.js, a decoy,
@@ -491,7 +543,23 @@ type Route = Setup & { name: string; args: string[]; native?: false; requests?: 
 const HANDED_BACK: Route[] = [
   { name: "no arguments", args: [] },
   { name: "--help", args: ["--help"] },
-  { name: "another command", args: ["news", "--limit", "5"] },
+  { name: "another command", args: ["read", "#general"] },
+  { name: "news with an argument", args: ["news", "x"] },
+  { name: "news --limit with no value", args: ["news", "--limit"] },
+  { name: "news -l5", args: ["news", "-l5"] },
+  { name: "news --limit abc", args: ["news", "--limit", "abc"] },
+  { name: "news --limit twice", args: ["news", "-l", "1", "--limit", "2"] },
+  { name: "news --json", args: ["news", "--json"] },
+  { name: "news --help", args: ["news", "--help"] },
+  { name: "news: TZ in POSIX form", args: ["news"], env: { TZ: "EST5EDT" } },
+  { name: "news: TZ naming no zone", args: ["news"], env: { TZ: "Foo/Bar" } },
+  { name: "news: an empty TZ", args: ["news"], env: { TZ: "" } },
+  { name: "news: TZ with a leading colon", args: ["news"], env: { TZ: ":Asia/Tokyo" } },
+  { name: "news: TZ from a dotenv file", args: ["news"], env: { TZ: null }, files: { ".config/slack-cli/.env": "TZ=America/New_York\n" } },
+  { name: "news: a settings.yml", args: ["news"], files: { ".config/slack-hub/settings.yml": "x: 1\n" } },
+  { name: "news: SLACK_HUB_NO_NATIVE=1", args: ["news"], env: { SLACK_HUB_NO_NATIVE: "1" } },
+  { name: "news: a message from before 1970", args: ["news"], fixtures: { "search.messages": page([{ ts: "-86400.000000", text: "old" }]) }, requests: "some" },
+  { name: "news: a body that is not JSON", args: ["news"], fixtures: { "search.messages": { __raw: "<html>" } }, requests: "some" },
   { name: "a write command", args: ["send", "#general", "hi"] },
   { name: "search without a query", args: ["search"] },
   { name: "search --help", args: ["search", "--help"] },
@@ -572,12 +640,13 @@ const HANDED_BACK: Route[] = [
 const NATIVE_WITH_ROOT: Case[] = [
   { name: "installed: search is native", args: ["search", "deploy"] },
   { name: "installed: search --json is native", args: ["search", "deploy", "--json", "-n", "3"] },
+  { name: "installed: news is native", args: ["news", "-l", "5"], fixtures: NEWS },
 ];
 
 // ─────────────────────────────── tests ───────────────────────────────
 
 describe.skipIf(!ENABLED)("parity: TypeScript against Rust", () => {
-  for (const c of SEARCH) {
+  for (const c of [...SEARCH, ...NEWS_CASES]) {
     test(c.name, { timeout: 60_000 }, async () => {
       const tsOut = await run(TS_IMPL, c);
       c.check?.(tsOut);
@@ -670,10 +739,12 @@ const PTY = [
   "sys.exit(os.waitstatus_to_exitcode(status) % 256)",
 ].join("\n");
 const HAVE_PTY = process.platform !== "win32" && spawnSync("python3", ["-I", "-B", "-c", "import pty"]).status === 0;
+if (BIN_DIR && !HAVE_PTY) throw new Error("RUSTIFY_BIN_DIR is set, but python3's pty module is missing: the terminal cases would be skipped");
 // -I -B: python itself must leave nothing in HOME (bytecode caches).
 const onTerminal = (impl: Impl): Impl => ({ cmd: "python3", args: ["-I", "-B", "-c", PTY, impl.cmd, ...impl.args] });
 
 const TERMINAL: Case[] = [
+  { name: "terminal: news output", args: ["news", "-l", "8"], fixtures: NEWS, check: has("stdout", "----------------------------") },
   { name: "terminal: an error is red, as bun's console.error prints it", args: ["search", "deploy"], env: { SLACK_TOKEN: null }, check: has("stdout", "\x1b[31mNo Slack token found") },
   { name: "terminal: NO_COLOR=1", args: ["search", "deploy"], env: { SLACK_TOKEN: null, NO_COLOR: "1" }, check: (o) => expect(o.stdout).not.toContain("\x1b[") },
   { name: "terminal: an empty NO_COLOR still colours", args: ["search", "deploy"], env: { SLACK_TOKEN: null, NO_COLOR: "" } },
@@ -701,10 +772,10 @@ describe.skipIf(!ENABLED || !HAVE_PTY)("parity: on a terminal", () => {
   }
 });
 
-// A real pipe, as a shell gives one: the writer always sees EPIPE. (Node and
-// bun give a child's stdio a socket pair instead, where the error is EPIPE or
-// ENOTCONN depending on timing — for both implementations alike — so that
-// cannot be compared run against run.)
+// A real pipe, as a shell gives one: the writer always sees EPIPE. (bun, like
+// Node's libuv, gives a child's stdio a socket pair instead, where the error
+// is EPIPE or ENOTCONN depending on timing — for both implementations alike —
+// so that cannot be compared run against run.)
 const piped = (impl: Impl): Impl => ({
   cmd: "bash",
   args: ["-c", '"$@" | head -c 100 > /dev/null; echo "exit ${PIPESTATUS[0]}" >&2', "piped", impl.cmd, ...impl.args],

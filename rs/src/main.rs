@@ -8,12 +8,14 @@
 
 mod api;
 mod cache;
+mod cli;
 mod config;
 mod js;
 mod js_fallback;
 mod legacy;
 mod msgfmt;
 mod newlines;
+mod news;
 mod out;
 mod search;
 mod slack;
@@ -37,6 +39,7 @@ fn main() {
         // `slack --version`, answered by the binary itself.
         Some("--version") if args.len() == 1 && native() => println!("{}", env!("CARGO_PKG_VERSION")),
         Some("search") if native() => search::run(&args),
+        Some("news") if native() => news::run(&args),
         _ => js_fallback::run(JS_ENTRY),
     }
 }
