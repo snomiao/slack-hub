@@ -1,59 +1,161 @@
 name: Release
 
+# A release is decided by semantic-release from the commits on main, built for
+# every platform, install-tested, and only then tagged and published:
+#
+#   plan     which version would this commit release? (nothing is written)
+#   build    Rust `slack` for six platforms + the JavaScript, packed as npm
+#            packages and installed with bun and npm on Linux, macOS, Windows
+#   release  git tag + GitHub release
+#   publish  npm: the platform builds, then slack-hub, then slack-term
+#   verify   install from npm on every OS and run it
+#
+# If a job after `release` fails, use "Re-run failed jobs" on this run: the
+# version is already decided and publishing the same version twice is harmless.
+#
+# The build pipeline lives in https://github.com/snomiao/rustify. npm trusted
+# publishing is configured for this file, for slack-hub and slack-term.
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      rehearse:
+        description: "Build, pack and install-test on every platform, but tag and publish nothing"
+        type: boolean
+        default: false
 
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
-  release:
+  plan:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
-      contents: write       # git tag + GitHub Release
-      issues: write         # semantic-release comments
-      pull-requests: write  # semantic-release comments
-      id-token: write       # OIDC → npm trusted publishing + provenance
+      contents: write       # semantic-release checks that it could push the tag
+      issues: write
+      pull-requests: write
+    outputs:
+      version: ${{ steps.next.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: true
-
       - uses: oven-sh/setup-bun@v2
-
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
-
       - run: bun install --frozen-lockfile
+      - name: Next version (dry run)
+        id: next
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bunx semantic-release --dry-run | tee semantic-release.log
+          version="$(sed -nE 's/.*next release version is ([0-9][0-9A-Za-z.+-]*).*/\1/p' semantic-release.log | tail -1)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Next version: ${version:-none, nothing to release}"
 
-      - run: bun run typecheck
-      - run: bun run build
+  build:
+    needs: plan
+    if: needs.plan.outputs.version != '' || inputs.rehearse
+    uses: snomiao/rustify/.github/workflows/rust-npm-build.yml@releases/v1
+    with:
+      manifest: rs/Cargo.toml
+      bins: slack
+      version: ${{ needs.plan.outputs.version || format('0.0.0-rehearsal.{0}', github.run_number) }}
+      # The PII scan and the typecheck used to run in prepublishOnly. Packages
+      # are now published as packed here, so they run before packing instead.
+      js-build: bun install --frozen-lockfile && bun run scan-pii:all && bun run typecheck && bun run build
+      # `--version` is answered by the binary itself; `--help` is handed back
+      # to the JavaScript, so both paths are checked on every machine.
+      smoke: slack --version
+      smoke-extra: |
+        slack --help => slack <command>
 
+  release:
+    needs: [plan, build]
+    if: needs.plan.outputs.version != '' && !inputs.rehearse
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write       # git tag + GitHub Release
+      issues: write         # semantic-release comments
+      pull-requests: write  # semantic-release comments
+    outputs:
+      version: ${{ steps.released.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: bun install --frozen-lockfile
+      # Tags and writes the GitHub release. It does not publish to npm
+      # (npmPublish is false in .releaserc.json); the publish job does.
       - name: Semantic release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_CONFIG_PROVENANCE: "true"
         run: bunx semantic-release
+      - name: Confirm the release
+        id: released
+        env:
+          PLANNED: ${{ needs.plan.outputs.version }}
+        run: |
+          tags="$(git tag --points-at HEAD)"
+          if echo "$tags" | grep -qx "v$PLANNED"; then
+            echo "version=$PLANNED" >> "$GITHUB_OUTPUT"
+          elif [ -n "$tags" ]; then
+            echo "::error::built v$PLANNED but this commit was tagged: $tags"
+            exit 1
+          else
+            # main moved on while this run was building; the newer run releases.
+            echo "::notice::no release on this commit"
+          fi
+
+  publish:
+    needs: [build, release]
+    if: needs.release.outputs.version != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write       # OIDC → npm trusted publishing + provenance
+    steps:
+      # slack-hub: the platform builds first, the package users install last.
+      - uses: snomiao/rustify/actions/publish@releases/v1
 
       # Mirror each release to the old npm name, `slack-term` (renamed to
-      # slack-hub). Same code, with npm/slack-term-README.md as its README
-      # (a migration guide). Deliberately NOT `npm deprecate`d: toolchains still
-      # depend on the name, so installs stay quiet and the CLI itself prints the
-      # deprecation notice (ts/brand.ts renameNotice). OIDC trusted publishing
-      # is set up for both packages.
+      # slack-hub). Same JavaScript, with npm/slack-term-README.md as its
+      # README (a migration guide); it stays JavaScript-only. Deliberately NOT
+      # `npm deprecate`d: toolchains still depend on the name, so installs stay
+      # quiet and the CLI itself prints the deprecation notice (ts/brand.ts
+      # renameNotice).
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
       - name: Publish slack-term (deprecated alias)
         env:
           NPM_CONFIG_PROVENANCE: "true"
+          VERSION: ${{ needs.release.outputs.version }}
         run: |
-          v=$(node -p "require('./package.json').version")
-          if ! git tag --points-at HEAD | grep -qx "v$v"; then echo "no release on this commit"; exit 0; fi
-          if npm view "slack-term@$v" version >/dev/null 2>&1; then echo "slack-term@$v already published"; exit 0; fi
+          if npm view "slack-term@$VERSION" version >/dev/null 2>&1; then echo "slack-term@$VERSION already published"; exit 0; fi
           cp npm/slack-term-README.md README.md
-          npm pkg set name=slack-term description="DEPRECATED: renamed to slack-hub — npm i -g slack-hub. $(node -p "require('./package.json').description")"
+          npm pkg set version="$VERSION" name=slack-term description="DEPRECATED: renamed to slack-hub — npm i -g slack-hub. $(node -p "require('./package.json').description")"
           npm publish --access public
+
+  verify:
+    needs: [build, publish]
+    uses: snomiao/rustify/.github/workflows/rust-npm-verify.yml@releases/v1
+    with:
+      smoke: slack --version
+      smoke-extra: |
+        slack --help => slack <command>
