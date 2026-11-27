@@ -681,6 +681,25 @@ describe.skipIf(!ENABLED || SELF)("parity: what the binary hands back to the Jav
       }
     });
   }
+  // ts/cli.ts is bun's to run (its first line asks for bun), so without bun the
+  // hand-back says bun is needed, and a node on PATH is not given the file.
+  test("without bun, a hand-back says bun is needed", { timeout: 60_000 }, async () => {
+    const root = pkg();
+    const path = realpathSync(mkdtempSync(join(tmpdir(), "slack-parity-path-")));
+    try {
+      writeFileSync(join(path, "node"), '#!/bin/sh\necho "node was given $1" >&2\nexit 9\n', { mode: 0o755 });
+      const out = await run(RS_IMPL, { args: ["--help"] }, { SLACK_HUB_PACKAGE_ROOT: root, PATH: path });
+      const script = join(root, "ts", "cli.ts");
+      expect({ stdout: out.stdout, stderr: out.stderr, exit: out.exit }).toEqual({
+        stdout: "",
+        stderr: `cannot run ${script}: it needs bun, which could not be started (No such file or directory (os error 2)). See https://bun.sh\n`,
+        exit: 127,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
   for (const c of NATIVE_WITH_ROOT) {
     test(c.name, { timeout: 60_000 }, async () => {
       const root = pkg();
