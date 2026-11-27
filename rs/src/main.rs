@@ -190,7 +190,10 @@ fn main() -> Result<()> {
     // and are not at parity yet. Until they are, hand everything else back.
     // SLACK_HUB_NATIVE=1 runs the Rust commands anyway, for comparing the two.
     if std::env::var_os("SLACK_HUB_NATIVE").is_none() && js_fallback::package_root().is_some() {
-        js_fallback::run("dist/cli.js");
+        // ts/cli.ts, not dist/cli.js: it is what the published package runs.
+        // npm does not apply publishConfig.bin, so `bin` (ts/cli.ts) is the
+        // command users have today; the bundle only ships alongside.
+        js_fallback::run("ts/cli.ts");
     }
     run()
 }
