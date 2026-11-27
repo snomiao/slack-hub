@@ -20,8 +20,10 @@ mod out;
 mod search;
 mod slack;
 
-/// The package's JavaScript entry, relative to the package root.
-pub const JS_ENTRY: &str = "dist/cli.js";
+/// The package's JavaScript entry, relative to the package root: what the
+/// published `slack` runs today. That is `bin` (ts/cli.ts, under bun), not
+/// `publishConfig.bin` (the bundle dist/cli.js), which npm does not apply.
+pub const JS_ENTRY: &str = "ts/cli.ts";
 
 /// `SLACK_HUB_NO_NATIVE=1` hands every command back to the JavaScript: the
 /// way out for a user if a ported command misbehaves.
